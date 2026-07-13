@@ -19,7 +19,72 @@ internal object InferenceParityFixtureReader {
             "fixture_type is unsupported."
         }
         require(root["cases"].asArray("cases").isNotEmpty()) { "cases must not be empty." }
+        if (fixtureType == "genie_tts_parity_contract") validateParityContract(root)
         return root
+    }
+
+    private fun validateParityContract(root: Map<String, Any?>) {
+        root["cases"].asArray("cases").forEach { rawCase ->
+            val expected = rawCase.asObject("case")["expected"].asObject("expected")
+            require(expected["normalized_text"] is String) { "expected.normalized_text must be a string." }
+            require(expected["phones"].asArray("expected.phones").isNotEmpty()) { "expected.phones must not be empty." }
+            expected["phones"].asArray("expected.phones").forEach { require(it is String) { "expected.phones must contain strings." } }
+            requireIntegerTensor(expected["phone_ids"], "expected.phone_ids")
+            requireIntegerTensor(expected["word2ph"], "expected.word2ph")
+            requireIntegerTensor(expected["semantic_tokens"], "expected.semantic_tokens")
+
+            val tensors = expected["tensors"].asObject("expected.tensors")
+            listOf("reference_pcm", "hubert_features", "speaker_embedding", "prompt_conditioning", "t2s_output", "vocoder_output").forEach { name ->
+                requireFloatTensor(tensors[name], "expected.tensors.$name")
+            }
+
+            val stages = expected["timing"].asObject("expected.timing")["stages"].asArray("expected.timing.stages")
+            require(stages.size == 6) { "expected.timing.stages must contain six records." }
+            stages.forEach { stage ->
+                val record = stage.asObject("timing stage")
+                require(record["name"] is String) { "timing stage name must be a string." }
+                requireNonNegativeInteger(record["elapsed_ms"], "timing stage elapsed_ms")
+            }
+
+            val trace = expected["trace"].asArray("expected.trace")
+            require(trace.size == 6) { "expected.trace must contain six records." }
+            trace.forEach { rawRecord ->
+                val record = rawRecord.asObject("trace record")
+                listOf("model_role", "provider", "cache_status").forEach { key ->
+                    require(record[key] is String) { "trace $key must be a string." }
+                }
+                record["tensor_shape"].asArray("trace tensor_shape").forEach { requireNonNegativeInteger(it, "trace tensor_shape") }
+                requireNonNegativeInteger(record["elapsed_ms"], "trace elapsed_ms")
+            }
+        }
+    }
+
+    private fun requireIntegerTensor(value: Any?, label: String) {
+        val tensor = value.asObject(label)
+        require(tensor["dtype"] == "int64") { "$label dtype must be int64." }
+        requireShape(tensor["shape"], "$label.shape")
+        tensor["values"].asArray("$label.values").forEach { require(it is Long) { "$label values must be integers." } }
+    }
+
+    private fun requireFloatTensor(value: Any?, label: String) {
+        val tensor = value.asObject(label)
+        require(tensor["dtype"] == "float32") { "$label dtype must be float32." }
+        requireShape(tensor["shape"], "$label.shape")
+        require(tensor["sha256"] is String && (tensor["sha256"] as String).matches(Regex("[0-9a-f]{64}"))) { "$label sha256 must be a 64-character lowercase hex string." }
+        val statistics = tensor["statistics"].asObject("$label.statistics")
+        requireNonNegativeInteger(statistics["finite_count"], "$label.statistics.finite_count")
+        requireNonNegativeInteger(statistics["non_finite_count"], "$label.statistics.non_finite_count")
+        listOf("min", "max", "mean").forEach { key ->
+            require(statistics[key] is Number && (statistics[key] as Number).toDouble().isFinite()) { "$label.statistics.$key must be finite." }
+        }
+    }
+
+    private fun requireShape(value: Any?, label: String) {
+        value.asArray(label).forEach { requireNonNegativeInteger(it, label) }
+    }
+
+    private fun requireNonNegativeInteger(value: Any?, label: String) {
+        require(value is Long && value >= 0L) { "$label must be a non-negative integer." }
     }
 }
 

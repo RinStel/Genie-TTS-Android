@@ -76,6 +76,31 @@ class InferenceParityFixtureTest {
     }
 
     @Test
+    fun fullContractReaderRejectsMissingOrInvalidParitySections() {
+        val valid = javaClass.classLoader
+            ?.getResourceAsStream("parity/full_contract_case.json")
+            ?.bufferedReader(Charsets.UTF_8)
+            ?.use { it.readText() }
+            ?: error("full parity fixture resource was not found")
+
+        listOf(
+            valid.replace("\"normalized_text\":", "\"missing_normalized_text\":"),
+            valid.replace("\"reference_pcm\":", "\"missing_reference_pcm\":"),
+            valid.replace("\"vocoder_output\":", "\"missing_vocoder_output\":"),
+            valid.replace("\"semantic_tokens\":", "\"missing_semantic_tokens\":"),
+            valid.replace("\"timing\":", "\"missing_timing\":"),
+            valid.replace("\"trace\":", "\"missing_trace\":"),
+            valid.replace("\"dtype\": \"float32\"", "\"dtype\": \"int64\""),
+            valid.replace("\"dtype\": \"int64\"", "\"dtype\": \"float32\""),
+            valid.replace("\"elapsed_ms\": 12", "\"elapsed_ms\": -1"),
+        ).forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) {
+                InferenceParityFixtureReader.decode(invalid)
+            }
+        }
+    }
+
+    @Test
     fun traceLoggerDoesNotExposeRawStringEventInterface() {
         assertFalse(
             InferenceTraceLogger::class.java.methods.any { method ->
