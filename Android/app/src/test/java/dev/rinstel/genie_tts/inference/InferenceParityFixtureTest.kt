@@ -2,7 +2,6 @@ package dev.rinstel.genie_tts.inference
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
@@ -102,39 +101,53 @@ class InferenceParityFixtureTest {
 
     @Test
     fun traceLoggerDoesNotExposeRawStringEventInterface() {
+        val eventMethods = InferenceTraceLogger::class.java.methods.filter { it.name == "event" }
+
         assertFalse(
-            InferenceTraceLogger::class.java.methods.any { method ->
+            eventMethods.any { method ->
                 method.name == "event" &&
                     method.parameterTypes.contentEquals(arrayOf(String::class.java, String::class.java))
             },
         )
+        assertEquals(
+            listOf(InferenceTraceEvent::class.java),
+            eventMethods.map { it.parameterTypes.singleOrNull() },
+        )
     }
 
     @Test
-    fun legacyTraceEventsRejectRawUserMessages() {
-        assertFalse(InferenceTraceLogger.isAllowedLegacyEvent("runtime_label", "用户输入文本"))
-        assertFalse(InferenceTraceLogger.isAllowedLegacyEvent("runtime_label", "C:/private/model.onnx"))
-        assertFalse(InferenceTraceLogger.isAllowedLegacyEvent("unknown", "42"))
-        assertEquals(true, InferenceTraceLogger.isAllowedLegacyEvent("semantic_tokens", "42"))
-        assertEquals(true, InferenceTraceLogger.isAllowedLegacyEvent("reference_cache", "hit"))
-        assertEquals(true, InferenceTraceLogger.isAllowedLegacyEvent("runtime_label", "ORT QNN EP"))
+    fun typedTraceEventsSerializeMetadataOnly() {
+        assertEquals("runtime_label: ORT QNN EP", InferenceTraceEvent.Runtime(InferenceRuntimeLabel.QNN).toLogLine())
+        assertEquals("semantic_tokens: 42", InferenceTraceEvent.TensorCount(InferenceTensorMetric.SEMANTIC_TOKENS, 42L).toLogLine())
+        assertEquals("reference_cache: hit", InferenceTraceEvent.Cache(InferenceCacheStatus.HIT).toLogLine())
     }
 
     @Test
-    fun inferenceTimerRejectsUnsafeEventBeforeLoggerBoundary() {
-        var captured: Pair<String, String>? = null
+    fun inferenceTimerForwardsTypedEventsWithoutRawMessages() {
+        val captured = mutableListOf<InferenceTraceEvent>()
         val logger = object : InferenceTraceLogger {
             override fun stage(name: String, elapsedMs: Long) = Unit
 
-            override fun event(name: String, message: String) {
-                captured = name to message
-            }
+            override fun event(event: InferenceTraceEvent) { captured += event }
         }
 
-        assertThrows(IllegalArgumentException::class.java) {
-            InferenceTimer(logger).event("runtime_label", "C:/private/model.onnx")
-        }
-        assertNull(captured)
+        InferenceTimer(logger).event(InferenceTraceEvent.Runtime(InferenceRuntimeLabel.QNN))
+        InferenceTimer(logger).event(
+            InferenceTraceEvent.Model(
+                InferenceTraceRecord(
+                    modelRole = InferenceModelRole.T2S,
+                    provider = InferenceProvider.QNN,
+                    tensorShape = longArrayOf(1L, 8L),
+                    cacheStatus = InferenceCacheStatus.MISS,
+                    elapsedMs = 7L,
+                ),
+            ),
+        )
+
+        assertEquals(
+            listOf("runtime_label: ORT QNN EP", "role=t2s provider=qnn shape=[1,8] cache=miss elapsed_ms=7"),
+            captured.map(InferenceTraceEvent::toLogLine),
+        )
     }
 
     @Test
