@@ -38,14 +38,14 @@ class OrtRuntimeFeatureExtractor(
         }
 
         val isV2ProPlus = backend.hasPromptEncoder()
-        val normalizedLanguage = LanguageNormalizer.normalize(request.language)
+        val normalizedPromptLanguage = LanguageNormalizer.normalize(request.promptLanguage)
         val textFeatures = timer.measure("text_features_ms") {
             textFeatureExtractor.extract(
                 request.language,
                 GenieTextConventions.prepareSynthesisText(request.language, request.synthesisText),
             )
         }
-        val cacheKey = referenceCacheKey(request, normalizedLanguage, isV2ProPlus)
+        val cacheKey = referenceCacheKey(request, normalizedPromptLanguage, isV2ProPlus)
         val cachedReference = referenceCache.get(cacheKey)
         val reference = if (cachedReference != null) {
             timer.event(InferenceTraceEvent.Cache(InferenceCacheStatus.HIT))
@@ -57,7 +57,7 @@ class OrtRuntimeFeatureExtractor(
             referenceCache.getOrPut(cacheKey) {
                 computeReferenceConditioning(
                     request = request,
-                    normalizedLanguage = normalizedLanguage,
+                    normalizedPromptLanguage = normalizedPromptLanguage,
                     isV2ProPlus = isV2ProPlus,
                     timer = timer,
                 )
@@ -88,12 +88,12 @@ class OrtRuntimeFeatureExtractor(
 
     private fun computeReferenceConditioning(
         request: GenerationRequest,
-        normalizedLanguage: String,
+        normalizedPromptLanguage: String,
         isV2ProPlus: Boolean,
         timer: InferenceTimer,
     ): ReferenceConditioning {
         val refFeatures = timer.measure("reference_text_features_ms") {
-            textFeatureExtractor.extract(normalizedLanguage, request.referenceText)
+            textFeatureExtractor.extract(normalizedPromptLanguage, request.referenceText)
         }
         val refAudio32k = timer.measure("reference_audio_load_ms") {
             loadReferenceAudio(File(request.referenceAudioPath), 32000)
@@ -139,13 +139,13 @@ class OrtRuntimeFeatureExtractor(
 
     private fun referenceCacheKey(
         request: GenerationRequest,
-        normalizedLanguage: String,
+        normalizedPromptLanguage: String,
         isV2ProPlus: Boolean,
     ): ReferenceConditioningCacheKey =
         ReferenceConditioningCacheKey(
             characterModelId = request.characterModel.id,
             backend = backend.backend,
-            language = normalizedLanguage,
+            language = normalizedPromptLanguage,
             referenceAudioPath = canonicalReferencePath(request.referenceAudioPath),
             referenceText = request.referenceText,
             usesPromptEncoder = isV2ProPlus,
