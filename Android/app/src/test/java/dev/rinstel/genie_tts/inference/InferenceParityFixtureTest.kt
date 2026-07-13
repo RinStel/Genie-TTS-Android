@@ -100,6 +100,36 @@ class InferenceParityFixtureTest {
     }
 
     @Test
+    fun fullContractReaderRejectsUnsafeOrUnexpectedTraceFields() {
+        val valid = fullContractFixture()
+
+        listOf(
+            valid.replace("\"provider\": \"cpu\"", "\"provider\": \"unsafe\""),
+            valid.replace("\"elapsed_ms\": 12}", "\"elapsed_ms\": 12, \"raw_text\": \"secret\"}"),
+        ).forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) {
+                InferenceParityFixtureReader.decode(invalid)
+            }
+        }
+    }
+
+    @Test
+    fun fullContractReaderRejectsUnexpectedTensorFieldsAndInconsistentDimensions() {
+        val valid = fullContractFixture()
+
+        listOf(
+            valid.replace("\"dtype\": \"float32\", \"shape\": [1, 3]", "\"dtype\": \"float32\", \"shape\": [1, 3], \"extra\": true"),
+            valid.replace("\"shape\": [1, 5], \"values\": [0, -2147483648, 42, 2147483647, 1]", "\"shape\": [1, 4], \"values\": [0, -2147483648, 42, 2147483647, 1]"),
+            valid.replace("\"finite_count\": 3, \"non_finite_count\": 0", "\"finite_count\": 2, \"non_finite_count\": 0"),
+            valid.replace("\"finite_count\": 3, \"non_finite_count\": 0", "\"finite_count\": 3.0, \"non_finite_count\": 0"),
+        ).forEach { invalid ->
+            assertThrows(IllegalArgumentException::class.java) {
+                InferenceParityFixtureReader.decode(invalid)
+            }
+        }
+    }
+
+    @Test
     fun traceLoggerDoesNotExposeRawStringEventInterface() {
         val eventMethods = InferenceTraceLogger::class.java.methods.filter { it.name == "event" }
 
@@ -160,4 +190,10 @@ class InferenceParityFixtureTest {
             )
         }
     }
+
+    private fun fullContractFixture(): String = javaClass.classLoader
+        ?.getResourceAsStream("parity/full_contract_case.json")
+        ?.bufferedReader(Charsets.UTF_8)
+        ?.use { it.readText() }
+        ?: error("full parity fixture resource was not found")
 }

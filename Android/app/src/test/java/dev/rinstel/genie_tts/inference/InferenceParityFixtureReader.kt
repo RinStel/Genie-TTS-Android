@@ -50,9 +50,10 @@ internal object InferenceParityFixtureReader {
             require(trace.size == 6) { "expected.trace must contain six records." }
             trace.forEach { rawRecord ->
                 val record = rawRecord.asObject("trace record")
-                listOf("model_role", "provider", "cache_status").forEach { key ->
-                    require(record[key] is String) { "trace $key must be a string." }
-                }
+                requireExactKeys(record, TRACE_RECORD_KEYS, "trace record")
+                require(record["model_role"] in MODEL_ROLE_WIRE_VALUES) { "trace model_role is unsupported." }
+                require(record["provider"] in PROVIDER_WIRE_VALUES) { "trace provider is unsupported." }
+                require(record["cache_status"] in CACHE_STATUS_WIRE_VALUES) { "trace cache_status is unsupported." }
                 record["tensor_shape"].asArray("trace tensor_shape").forEach { requireNonNegativeInteger(it, "trace tensor_shape") }
                 requireNonNegativeInteger(record["elapsed_ms"], "trace elapsed_ms")
             }
@@ -61,31 +62,54 @@ internal object InferenceParityFixtureReader {
 
     private fun requireIntegerTensor(value: Any?, label: String) {
         val tensor = value.asObject(label)
+        requireExactKeys(tensor, INTEGER_TENSOR_KEYS, label)
         require(tensor["dtype"] == "int64") { "$label dtype must be int64." }
-        requireShape(tensor["shape"], "$label.shape")
-        tensor["values"].asArray("$label.values").forEach { require(it is Long) { "$label values must be integers." } }
+        val shapeSize = requireShapeProduct(tensor["shape"], "$label.shape")
+        val values = tensor["values"].asArray("$label.values")
+        values.forEach { require(it is Long) { "$label values must be integers." } }
+        require(shapeSize == values.size.toLong()) { "$label shape product must equal values length." }
     }
 
     private fun requireFloatTensor(value: Any?, label: String) {
         val tensor = value.asObject(label)
+        requireExactKeys(tensor, FLOAT_TENSOR_KEYS, label)
         require(tensor["dtype"] == "float32") { "$label dtype must be float32." }
-        requireShape(tensor["shape"], "$label.shape")
+        val shapeSize = requireShapeProduct(tensor["shape"], "$label.shape")
         require(tensor["sha256"] is String && (tensor["sha256"] as String).matches(Regex("[0-9a-f]{64}"))) { "$label sha256 must be a 64-character lowercase hex string." }
         val statistics = tensor["statistics"].asObject("$label.statistics")
-        requireNonNegativeInteger(statistics["finite_count"], "$label.statistics.finite_count")
-        requireNonNegativeInteger(statistics["non_finite_count"], "$label.statistics.non_finite_count")
+        requireExactKeys(statistics, STATISTICS_KEYS, "$label.statistics")
+        val finiteCount = requireNonNegativeInteger(statistics["finite_count"], "$label.statistics.finite_count")
+        val nonFiniteCount = requireNonNegativeInteger(statistics["non_finite_count"], "$label.statistics.non_finite_count")
+        require(Math.addExact(finiteCount, nonFiniteCount) == shapeSize) {
+            "$label shape product must equal finite_count plus non_finite_count."
+        }
         listOf("min", "max", "mean").forEach { key ->
             require(statistics[key] is Number && (statistics[key] as Number).toDouble().isFinite()) { "$label.statistics.$key must be finite." }
         }
     }
 
-    private fun requireShape(value: Any?, label: String) {
-        value.asArray(label).forEach { requireNonNegativeInteger(it, label) }
+    private fun requireShapeProduct(value: Any?, label: String): Long {
+        return value.asArray(label).fold(1L) { product, dimension ->
+            Math.multiplyExact(product, requireNonNegativeInteger(dimension, label))
+        }
     }
 
-    private fun requireNonNegativeInteger(value: Any?, label: String) {
+    private fun requireNonNegativeInteger(value: Any?, label: String): Long {
         require(value is Long && value >= 0L) { "$label must be a non-negative integer." }
+        return value
     }
+
+    private fun requireExactKeys(record: Map<String, Any?>, allowed: Set<String>, label: String) {
+        require(record.keys == allowed) { "$label contains unsupported or missing keys." }
+    }
+
+    private val TRACE_RECORD_KEYS = setOf("model_role", "provider", "tensor_shape", "cache_status", "elapsed_ms")
+    private val INTEGER_TENSOR_KEYS = setOf("dtype", "shape", "values")
+    private val FLOAT_TENSOR_KEYS = setOf("dtype", "shape", "sha256", "statistics")
+    private val STATISTICS_KEYS = setOf("finite_count", "non_finite_count", "min", "max", "mean")
+    private val MODEL_ROLE_WIRE_VALUES = InferenceModelRole.entries.mapTo(mutableSetOf()) { it.wireValue }
+    private val PROVIDER_WIRE_VALUES = InferenceProvider.entries.mapTo(mutableSetOf()) { it.wireValue }
+    private val CACHE_STATUS_WIRE_VALUES = InferenceCacheStatus.entries.mapTo(mutableSetOf()) { it.wireValue }
 }
 
 internal object InferenceParityFixtureAssertions {
