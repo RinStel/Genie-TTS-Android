@@ -149,8 +149,42 @@ class LocalHttpApiServerTest {
         assertEquals("zh", bridge.capturedRequest?.language)
     }
 
+    @Test
+    fun getInferUsesIndependentPromptLanguageFromActiveDefaults() {
+        val bridge = FakeBridge(
+            defaults = ActiveDefaults(
+                backend = ExecutionBackend.CPU,
+                modelId = "mansui",
+                language = "en",
+                promptLanguage = "zh",
+                referenceAudioPath = "/tmp/ref.wav",
+                referenceText = "sample",
+                maxDecoderSteps = 500,
+            ),
+        )
+        val server = LocalHttpApiServer(bridge)
+
+        val response = server.handleRequestForTest(
+            method = "GET",
+            path = "/infer",
+            queryParams = mapOf("text" to "hello world"),
+        )
+
+        assertEquals(200, response.statusCode)
+        assertEquals("en", bridge.capturedRequest?.language)
+        assertEquals("zh", bridge.capturedRequest?.promptLanguage)
+    }
+
     private class FakeBridge(
         private val enabledBackends: Set<ExecutionBackend> = ExecutionBackend.entries.toSet(),
+        private val defaults: ActiveDefaults = ActiveDefaults(
+            backend = ExecutionBackend.CPU,
+            modelId = "mansui",
+            language = "zh",
+            referenceAudioPath = "/tmp/ref.wav",
+            referenceText = "sample",
+            maxDecoderSteps = 500,
+        ),
     ) : LocalHttpApiServer.Bridge {
         private val models = CharacterModelCatalog.v2ProPlusFromCharacterIds(listOf("mansui"))
 
@@ -163,14 +197,7 @@ class LocalHttpApiServerTest {
 
         override fun supportedBackends(): Set<ExecutionBackend> = enabledBackends
 
-        override fun activeDefaults(): ActiveDefaults? = ActiveDefaults(
-            backend = ExecutionBackend.CPU,
-            modelId = "mansui",
-            language = "zh",
-            referenceAudioPath = "/tmp/ref.wav",
-            referenceText = "sample",
-            maxDecoderSteps = 500,
-        )
+        override fun activeDefaults(): ActiveDefaults = defaults
 
         override fun infer(backend: ExecutionBackend, request: GenerationRequest): Boolean {
             capturedBackend = backend

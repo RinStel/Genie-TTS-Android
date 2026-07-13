@@ -234,6 +234,9 @@ class MainActivity : AppCompatActivity() {
             ArrayAdapter(this, android.R.layout.simple_list_item_1, LANGUAGE_OPTIONS.map(LanguageOption::label)),
         )
         promptLanguageSelector.setText(LANGUAGE_OPTIONS.first().label, false)
+        promptLanguageSelector.setOnItemClickListener { _, _, _, _ ->
+            pushActiveDefaults()
+        }
 
         decoderStepsSlider.value = DEFAULT_MAX_DECODER_STEPS.toFloat()
         updateDecoderStepsSummary(DEFAULT_MAX_DECODER_STEPS)
@@ -561,6 +564,7 @@ class MainActivity : AppCompatActivity() {
                 referenceAudioPath = referenceInputState.backendAudioPath,
                 referenceText = referenceInputState.referenceText,
                 maxDecoderSteps = decoderStepsSlider.value.toInt(),
+                promptLanguage = selectedPromptLanguage().value,
             ),
         )
     }

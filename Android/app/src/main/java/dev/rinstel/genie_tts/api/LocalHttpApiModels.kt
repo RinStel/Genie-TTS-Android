@@ -19,6 +19,7 @@ data class ActiveDefaults(
     val referenceAudioPath: String,
     val referenceText: String,
     val maxDecoderSteps: Int,
+    val promptLanguage: String = language,
 )
 
 sealed class InferResult {

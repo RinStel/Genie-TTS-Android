@@ -157,7 +157,7 @@ class LocalHttpApiServer(
             backendName = params["backend"] ?: defaults?.backend?.name ?: "",
             modelId = params["modelId"] ?: defaults?.modelId ?: "",
             language = params["language"] ?: defaults?.language ?: "",
-            promptLanguage = params["promptLanguage"] ?: params["language"] ?: defaults?.language ?: "",
+            promptLanguage = params["promptLanguage"] ?: params["language"] ?: defaults?.promptLanguage ?: "",
             text = params["text"] ?: "",
             referenceAudioPath = params["referenceAudioPath"] ?: defaults?.referenceAudioPath ?: "",
             referenceText = params["referenceText"] ?: defaults?.referenceText ?: "",
