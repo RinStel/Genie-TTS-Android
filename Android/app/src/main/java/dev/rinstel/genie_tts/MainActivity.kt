@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var backendSelector: AutoCompleteTextView
     private lateinit var modelSelector: AutoCompleteTextView
     private lateinit var languageSelector: AutoCompleteTextView
+    private lateinit var promptLanguageSelector: AutoCompleteTextView
     private lateinit var synthesisTextInput: TextInputEditText
     private lateinit var referenceSourceValue: TextView
     private lateinit var referenceAudioValue: TextView
@@ -170,6 +171,7 @@ class MainActivity : AppCompatActivity() {
         backendSelector = findViewById(R.id.backendSelector)
         modelSelector = findViewById(R.id.modelSelector)
         languageSelector = findViewById(R.id.languageSelector)
+        promptLanguageSelector = findViewById(R.id.promptLanguageSelector)
         synthesisTextInput = findViewById(R.id.synthesisTextInput)
         referenceSourceValue = findViewById(R.id.referenceSourceValue)
         referenceAudioValue = findViewById(R.id.referenceAudioValue)
@@ -227,6 +229,11 @@ class MainActivity : AppCompatActivity() {
         languageSelector.setOnItemClickListener { _, _, _, _ ->
             pushActiveDefaults()
         }
+
+        promptLanguageSelector.setAdapter(
+            ArrayAdapter(this, android.R.layout.simple_list_item_1, LANGUAGE_OPTIONS.map(LanguageOption::label)),
+        )
+        promptLanguageSelector.setText(LANGUAGE_OPTIONS.first().label, false)
 
         decoderStepsSlider.value = DEFAULT_MAX_DECODER_STEPS.toFloat()
         updateDecoderStepsSummary(DEFAULT_MAX_DECODER_STEPS)
@@ -387,7 +394,7 @@ class MainActivity : AppCompatActivity() {
         val request = GenerationRequest(
             characterModel = selectedModel,
             language = selectedLanguage().value,
-            promptLanguage = selectedLanguage().value,
+            promptLanguage = selectedPromptLanguage().value,
             synthesisText = synthesisTextInput.text?.toString().orEmpty(),
             referenceAudioPath = referenceInputState.backendAudioPath,
             referenceText = referenceInputState.referenceText,
@@ -465,6 +472,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun selectedLanguage(): LanguageOption {
         val label = languageSelector.text?.toString().orEmpty()
+        return LANGUAGE_OPTIONS.firstOrNull { it.label == label } ?: LANGUAGE_OPTIONS.first()
+    }
+
+    private fun selectedPromptLanguage(): LanguageOption {
+        val label = promptLanguageSelector.text?.toString().orEmpty()
         return LANGUAGE_OPTIONS.firstOrNull { it.label == label } ?: LANGUAGE_OPTIONS.first()
     }
 
