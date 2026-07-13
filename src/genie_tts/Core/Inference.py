@@ -9,6 +9,29 @@ from ..GetPhonesAndBert import get_phones_and_bert
 MAX_T2S_LEN = 1000
 
 
+def slice_semantic_tokens(
+        decoder_token_outputs: np.ndarray,
+        completed_count: int,
+        terminal_token: int = 0,
+) -> np.ndarray:
+    """Return completed semantic tokens without the decoder's terminal output.
+
+    The stage decoder appends one token for every completed step.  Its final
+    output is only a stopping boundary: it can be EOS, a max-step token, or an
+    EOS token already replaced by ``terminal_token``.  It must not reach the
+    vocoder in any of those cases.
+    """
+    available_count = decoder_token_outputs.shape[-1]
+    count = min(max(completed_count, 0), available_count)
+    if count == 0:
+        return decoder_token_outputs[..., :0]
+
+    completed = decoder_token_outputs[..., available_count - count:]
+    if completed[..., -1].item() == terminal_token:
+        return completed[..., :-1]
+    return completed[..., :-1]
+
+
 class GENIE:
     def __init__(self):
         self.stop_event: threading.Event = threading.Event()
@@ -105,8 +128,9 @@ class GENIE:
             if stop_condition_tensor:
                 break
 
-        y[0, -1] = 0
-        return np.expand_dims(y[:, -idx:], axis=0)
+        completed_count = idx + 1
+        semantic_tokens = slice_semantic_tokens(y, completed_count)
+        return np.expand_dims(semantic_tokens, axis=0)
 
 
 tts_client: GENIE = GENIE()
