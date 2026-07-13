@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "fixture_type": "chinese_frontend",
+  "cases": [
+    {
+      "id": "contextual-polyphones",
+      "category": "contextual_polyphones",
+      "input_text": "银行行长正在长跑。"
+    },
+    {
+      "id": "neutral-tone",
+      "category": "neutral_tone",
+      "input_text": "妈妈，我们去吧。"
+    },
+    {
+      "id": "third-tone-chain",
+      "category": "third_tone_chain",
+      "input_text": "你好很好。"
+    },
+    {
+      "id": "numbers",
+      "category": "numbers",
+      "input_text": "今天是2026年7月13日。"
+    },
+    {
+      "id": "punctuation",
+      "category": "punctuation",
+      "input_text": "你好，世界！真的？"
+    },
+    {
+      "id": "erhua",
+      "category": "erhua",
+      "input_text": "这儿有一朵花儿。"
+    }
+  ]
+}
