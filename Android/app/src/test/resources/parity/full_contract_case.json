@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "fixture_type": "genie_tts_parity_contract",
+  "cases": [
+    {
+      "id": "full-contract-boundaries",
+      "category": "contract",
+      "input_text": "你好。",
+      "expected": {
+        "normalized_text": "你好。",
+        "phones": ["n", "i3", "h", "ao3", "."],
+        "phone_ids": {"dtype": "int64", "shape": [1, 5], "values": [0, -2147483648, 42, 2147483647, 1]},
+        "word2ph": {"dtype": "int64", "shape": [3], "values": [2, 2, 1]},
+        "semantic_tokens": {"dtype": "int64", "shape": [1, 2], "values": [-2147483648, 2147483647]},
+        "tensors": {
+          "roberta_features": {
+            "dtype": "float32",
+            "shape": [1, 2],
+            "sha256": "937d530fa41fcbc6164988a1952b69213dc6b6f9cdb8a939027135cf9979a710",
+            "statistics": {"finite_count": 2, "non_finite_count": 0, "min": 0.0, "max": 1.5, "mean": 0.75}
+          },
+          "bert_phone_ids": {"dtype": "int64", "shape": [1, 2], "values": [7, 11]}
+        },
+        "timing": {"stages": [{"name": "frontend", "elapsed_ms": 12}]},
+        "trace": [{"model_role": "frontend", "provider": "cpu", "tensor_shape": [1, 2], "cache_status": "n/a", "elapsed_ms": 12}]
+      }
+    }
+  ]
+}

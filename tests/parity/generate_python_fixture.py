@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.machinery
 import json
+import os
+import pickle
+import shutil
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Callable
 
 from fixture_schema import decode_fixture, serialize_integer_tensor
 
-
-def prepend_repository_src() -> Path:
-    repository_src = Path(__file__).resolve().parents[2] / "src"
-    repository_src_string = str(repository_src)
-    sys.path[:] = [path for path in sys.path if Path(path).resolve() != repository_src]
-    sys.path.insert(0, repository_src_string)
-    return repository_src
+ISOLATED_PACKAGE_NAME = "_genie_tts_parity"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_PACKAGE_ROOT = _REPOSITORY_ROOT / "src" / "genie_tts"
+_TEMP_RESOURCE_DIRECTORY: tempfile.TemporaryDirectory[str] | None = None
 
 
 def require_separate_output_path(source: Path, output: Path) -> None:
@@ -24,11 +28,34 @@ def require_separate_output_path(source: Path, output: Path) -> None:
         raise ValueError("Generator source and output must use separate output paths.")
 
 
+def load_chinese_to_phones() -> Callable[[str], tuple[str, list[str], list[int], list[int]]]:
+    """Load only the checkout Chinese frontend under an isolated namespace."""
+    module_name = f"{ISOLATED_PACKAGE_NAME}.G2P.Chinese.ChineseG2P"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing.chinese_to_phones
+
+    _install_namespace(ISOLATED_PACKAGE_NAME, _PACKAGE_ROOT)
+    _install_namespace(f"{ISOLATED_PACKAGE_NAME}.Core", _PACKAGE_ROOT / "Core")
+    _install_namespace(f"{ISOLATED_PACKAGE_NAME}.G2P", _PACKAGE_ROOT / "G2P")
+    _install_namespace(
+        f"{ISOLATED_PACKAGE_NAME}.G2P.Chinese",
+        _PACKAGE_ROOT / "G2P" / "Chinese",
+    )
+
+    resources = ModuleType(f"{ISOLATED_PACKAGE_NAME}.Core.Resources")
+    resources.__package__ = f"{ISOLATED_PACKAGE_NAME}.Core"
+    resources.Chinese_G2P_DIR = str(_resolve_chinese_g2p_directory())
+    sys.modules[resources.__name__] = resources
+
+    module = importlib.import_module(module_name)
+    return module.chinese_to_phones
+
+
 def generate_fixture(source: dict[str, Any]) -> dict[str, Any]:
     """Run the Python frontend for each source case without loading model weights."""
     decode_fixture(source)
-    prepend_repository_src()
-    from genie_tts.G2P.Chinese.ChineseG2P import chinese_to_phones
+    chinese_to_phones = load_chinese_to_phones()
 
     generated_cases = []
     for case in source["cases"]:
@@ -50,7 +77,56 @@ def generate_fixture(source: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
-    return {**source, "cases": generated_cases}
+    generated = {**source, "cases": generated_cases}
+    decode_fixture(generated)
+    return generated
+
+
+def _install_namespace(name: str, path: Path) -> None:
+    if name in sys.modules:
+        return
+    module = ModuleType(name)
+    module.__package__ = name
+    module.__path__ = [str(path)]
+    spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+    spec.submodule_search_locations = [str(path)]
+    module.__spec__ = spec
+    sys.modules[name] = module
+
+
+def _resolve_chinese_g2p_directory() -> Path:
+    configured = os.getenv("Chinese_G2P_DIR")
+    candidates = [
+        Path(configured) if configured else None,
+        _REPOSITORY_ROOT / "GenieData" / "G2P" / "ChineseG2P",
+        _REPOSITORY_ROOT / "Android" / "app" / "src" / "main" / "assets" / "chinese_g2p",
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if (candidate / "opencpop-strict.txt").is_file() and (
+            candidate / "polyphonic.pickle"
+        ).is_file():
+            return candidate
+        if (candidate / "opencpop-strict.txt").is_file() and (
+            candidate / "polyphonic.json"
+        ).is_file():
+            return _materialize_pickle_resources(candidate)
+    raise FileNotFoundError(
+        "Chinese G2P resources were not found. Set Chinese_G2P_DIR or provide repo Android assets."
+    )
+
+
+def _materialize_pickle_resources(source: Path) -> Path:
+    global _TEMP_RESOURCE_DIRECTORY
+    if _TEMP_RESOURCE_DIRECTORY is None:
+        _TEMP_RESOURCE_DIRECTORY = tempfile.TemporaryDirectory(prefix="genie-parity-g2p-")
+        target = Path(_TEMP_RESOURCE_DIRECTORY.name)
+        shutil.copyfile(source / "opencpop-strict.txt", target / "opencpop-strict.txt")
+        polyphonic = json.loads((source / "polyphonic.json").read_text(encoding="utf-8"))
+        with (target / "polyphonic.pickle").open("wb") as output:
+            pickle.dump(polyphonic, output, protocol=pickle.HIGHEST_PROTOCOL)
+    return Path(_TEMP_RESOURCE_DIRECTORY.name)
 
 
 def main() -> None:

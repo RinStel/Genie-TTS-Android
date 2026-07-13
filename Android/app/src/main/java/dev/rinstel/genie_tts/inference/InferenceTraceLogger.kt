@@ -32,6 +32,15 @@ data class InferenceTraceRecord(
     val cacheStatus: InferenceCacheStatus = InferenceCacheStatus.NOT_APPLICABLE,
     val elapsedMs: Long? = null,
 ) {
+    init {
+        require(tensorShape?.all { it >= 0L } != false) {
+            "Trace tensor dimensions must be non-negative."
+        }
+        require(elapsedMs == null || elapsedMs >= 0L) {
+            "Trace elapsed time must be non-negative."
+        }
+    }
+
     fun toLogLine(): String = buildList {
         add("role=${modelRole.wireValue}")
         add("provider=${provider.wireValue}")
@@ -44,6 +53,7 @@ data class InferenceTraceRecord(
 interface InferenceTraceLogger {
     fun stage(name: String, elapsedMs: Long)
 
+    /** Legacy compatibility boundary accepting only allowlisted numeric or enum metadata. */
     fun event(name: String, message: String)
 
     /** Emits typed metadata only; callers must never attach user text or audio samples. */
@@ -52,9 +62,80 @@ interface InferenceTraceLogger {
     }
 
     object None : InferenceTraceLogger {
-        override fun stage(name: String, elapsedMs: Long) = Unit
+        override fun stage(name: String, elapsedMs: Long) {
+            requireAllowedStage(name, elapsedMs)
+        }
 
-        override fun event(name: String, message: String) = Unit
+        override fun event(name: String, message: String) {
+            requireAllowedLegacyEvent(name, message)
+        }
+    }
+
+    companion object {
+        private val allowedStages = setOf(
+            "generation_total_ms",
+            "prepare_total_ms",
+            "backend_total_ms",
+            "write_wav_ms",
+            "text_features_ms",
+            "reference_text_features_ms",
+            "reference_audio_load_ms",
+            "reference_audio_resample_16k_ms",
+            "hubert_ms",
+            "speaker_encoder_ms",
+            "prompt_encoder_ms",
+            "t2s_encoder_ms",
+            "t2s_first_decoder_ms",
+            "decoder_loop_ms",
+            "vocoder_ms",
+        )
+        private val runtimeLabels = setOf(
+            "ORT CPU EP",
+            "ORT QNN EP",
+            "ORT XNNPACK EP",
+            "ORT QNN HTP (NPU)",
+            "ORT QNN CPU",
+        )
+        private val traceLinePattern = Regex(
+            "role=(frontend|roberta|hubert|speaker_encoder|prompt_encoder|t2s|vocoder) " +
+                "provider=(cpu|qnn|xnnpack)( shape=\\[(\\d+(,\\d+)*)?])? " +
+                "cache=(hit|miss|n/a)( elapsed_ms=\\d+)?",
+        )
+
+        fun isAllowedLegacyEvent(name: String, message: String): Boolean =
+            when (name) {
+                "resolved_backend" -> message in setOf("CPU", "QNN", "XNNPACK")
+                "runtime_label" -> message in runtimeLabels
+                "audio_samples", "semantic_tokens" -> message.isNonNegativeInteger()
+                "audio_shape", "semantic_shape" -> message.isTensorShape()
+                "reference_cache" -> message == "hit" || message == "miss"
+                "trace" -> traceLinePattern.matches(message)
+                else -> false
+            }
+
+        fun requireAllowedLegacyEvent(name: String, message: String) {
+            require(isAllowedLegacyEvent(name, message)) {
+                "Trace event metadata is not allowlisted."
+            }
+        }
+
+        fun requireAllowedStage(name: String, elapsedMs: Long) {
+            require(name in allowedStages && elapsedMs >= 0L) {
+                "Trace stage metadata is not allowlisted."
+            }
+        }
+
+        private fun String.isNonNegativeInteger(): Boolean =
+            toLongOrNull()?.let { it >= 0L } == true
+
+        private fun String.isTensorShape(): Boolean {
+            if (length < 2 || first() != '[' || last() != ']') return false
+            val dimensions = substring(1, lastIndex).trim()
+            if (dimensions.isEmpty()) return true
+            return dimensions.split(',').all { part ->
+                part.trim().toLongOrNull()?.let { it >= 0L } == true
+            }
+        }
     }
 }
 
@@ -62,10 +143,12 @@ class LogcatInferenceTraceLogger(
     private val tag: String = TAG,
 ) : InferenceTraceLogger {
     override fun stage(name: String, elapsedMs: Long) {
+        InferenceTraceLogger.requireAllowedStage(name, elapsedMs)
         Log.i(tag, "$name=$elapsedMs ms")
     }
 
     override fun event(name: String, message: String) {
+        InferenceTraceLogger.requireAllowedLegacyEvent(name, message)
         Log.i(tag, "$name: $message")
     }
 
@@ -83,6 +166,7 @@ class InferenceTimer(
     private val clockNanos: () -> Long = System::nanoTime,
 ) {
     fun <T> measure(name: String, block: () -> T): T {
+        InferenceTraceLogger.requireAllowedStage(name, 0L)
         val start = clockNanos()
         try {
             return block()
@@ -92,6 +176,7 @@ class InferenceTimer(
     }
 
     fun event(name: String, message: String) {
+        InferenceTraceLogger.requireAllowedLegacyEvent(name, message)
         logger.event(name, message)
     }
 
