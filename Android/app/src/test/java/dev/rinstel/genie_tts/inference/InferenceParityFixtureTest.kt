@@ -118,6 +118,7 @@ class InferenceParityFixtureTest {
         val valid = fullContractFixture()
 
         listOf(
+            valid.replace("\"tensors\": {", "\"tensors\": {\"unknown_tensor\": {},"),
             valid.replace("\"dtype\": \"float32\", \"shape\": [1, 3]", "\"dtype\": \"float32\", \"shape\": [1, 3], \"extra\": true"),
             valid.replace("\"shape\": [1, 5], \"values\": [0, -2147483648, 42, 2147483647, 1]", "\"shape\": [1, 4], \"values\": [0, -2147483648, 42, 2147483647, 1]"),
             valid.replace("\"finite_count\": 3, \"non_finite_count\": 0", "\"finite_count\": 2, \"non_finite_count\": 0"),

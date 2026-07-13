@@ -34,7 +34,8 @@ internal object InferenceParityFixtureReader {
             requireIntegerTensor(expected["semantic_tokens"], "expected.semantic_tokens")
 
             val tensors = expected["tensors"].asObject("expected.tensors")
-            listOf("reference_pcm", "hubert_features", "speaker_embedding", "prompt_conditioning", "t2s_output", "vocoder_output").forEach { name ->
+            requireExactKeys(tensors, REQUIRED_BOUNDARY_TENSOR_NAMES, "expected.tensors")
+            REQUIRED_BOUNDARY_TENSOR_NAMES.forEach { name ->
                 requireFloatTensor(tensors[name], "expected.tensors.$name")
             }
 
@@ -104,6 +105,14 @@ internal object InferenceParityFixtureReader {
     }
 
     private val TRACE_RECORD_KEYS = setOf("model_role", "provider", "tensor_shape", "cache_status", "elapsed_ms")
+    private val REQUIRED_BOUNDARY_TENSOR_NAMES = setOf(
+        "reference_pcm",
+        "hubert_features",
+        "speaker_embedding",
+        "prompt_conditioning",
+        "t2s_output",
+        "vocoder_output",
+    )
     private val INTEGER_TENSOR_KEYS = setOf("dtype", "shape", "values")
     private val FLOAT_TENSOR_KEYS = setOf("dtype", "shape", "sha256", "statistics")
     private val STATISTICS_KEYS = setOf("finite_count", "non_finite_count", "min", "max", "mean")
