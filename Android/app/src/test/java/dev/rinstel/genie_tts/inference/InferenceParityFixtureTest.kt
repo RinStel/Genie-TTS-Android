@@ -38,7 +38,6 @@ class InferenceParityFixtureTest {
             expected.tensorValues("phone_ids"),
         )
         assertEquals(listOf(-2147483648L, 2147483647L), expected.tensorValues("semantic_tokens"))
-        assertEquals(listOf(7L, 11L), expected.namedTensorValues("bert_phone_ids"))
         assertEquals("cpu", expected.firstTrace()["provider"])
     }
 
@@ -52,6 +51,38 @@ class InferenceParityFixtureTest {
                 "{\"schema_version\":2,\"fixture_type\":\"chinese_frontend\",\"cases\":[]}",
             )
         }
+    }
+
+    @Test
+    fun fullContractReaderRejectsEmptyExpectedAndMissingBoundaryRecords() {
+        val valid = javaClass.classLoader
+            ?.getResourceAsStream("parity/full_contract_case.json")
+            ?.bufferedReader(Charsets.UTF_8)
+            ?.use { it.readText() }
+            ?: error("full parity fixture resource was not found")
+
+        assertThrows(IllegalArgumentException::class.java) {
+            InferenceParityFixtureReader.decode(valid.replace("\"expected\": {", "\"expected\": {}"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            InferenceParityFixtureReader.decode(valid.replace("\"reference_pcm\": {", "\"missing_pcm\": {"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            InferenceParityFixtureReader.decode(valid.replace("\"sha256\": \"", "\"sha256\": \"not-a-hash"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            InferenceParityFixtureReader.decode(valid.replace("\"elapsed_ms\": 12", "\"elapsed_ms\": -1"))
+        }
+    }
+
+    @Test
+    fun traceLoggerDoesNotExposeRawStringEventInterface() {
+        assertFalse(
+            InferenceTraceLogger::class.java.methods.any { method ->
+                method.name == "event" &&
+                    method.parameterTypes.contentEquals(arrayOf(String::class.java, String::class.java))
+            },
+        )
     }
 
     @Test

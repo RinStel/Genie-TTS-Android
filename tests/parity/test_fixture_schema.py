@@ -167,12 +167,62 @@ def test_full_contract_fixture_validates_all_parity_boundaries() -> None:
     assert expected["phones"] == ["n", "i3", "h", "ao3", "."]
     assert expected["phone_ids"]["values"][1:4] == [-2147483648, 42, 2147483647]
     assert expected["semantic_tokens"]["values"] == [-2147483648, 2147483647]
-    assert expected["tensors"]["roberta_features"]["sha256"] == (
-        "937d530fa41fcbc6164988a1952b69213dc6b6f9cdb8a939027135cf9979a710"
-    )
-    assert expected["tensors"]["bert_phone_ids"]["values"] == [7, 11]
+    assert set(expected["tensors"]) == {
+        "reference_pcm",
+        "hubert_features",
+        "speaker_embedding",
+        "prompt_conditioning",
+        "t2s_output",
+        "vocoder_output",
+    }
+    assert expected["tensors"]["reference_pcm"]["dtype"] == "float32"
+    assert expected["tensors"]["vocoder_output"]["statistics"]["finite_count"] == 3
     assert expected["timing"]["stages"][0]["elapsed_ms"] == 12
-    assert expected["trace"][0]["provider"] == "cpu"
+    assert {record["model_role"] for record in expected["trace"]} == {
+        "frontend",
+        "hubert",
+        "speaker_encoder",
+        "prompt_encoder",
+        "t2s",
+        "vocoder",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda document: document["cases"][0].pop("expected"),
+        lambda document: document["cases"][0].update({"expected": {}}),
+        lambda document: document["cases"][0]["expected"].pop("tensors"),
+        lambda document: document["cases"][0]["expected"].pop("semantic_tokens"),
+        lambda document: document["cases"][0]["expected"].pop("timing"),
+        lambda document: document["cases"][0]["expected"].pop("trace"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("reference_pcm"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("hubert_features"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("speaker_embedding"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("prompt_conditioning"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("t2s_output"),
+        lambda document: document["cases"][0]["expected"]["tensors"].pop("vocoder_output"),
+        lambda document: document["cases"][0]["expected"]["trace"].pop(),
+    ),
+)
+def test_full_contract_rejects_missing_required_boundaries(mutate) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "full_contract_case.json"
+    document = deepcopy(json.loads(fixture_path.read_text(encoding="utf-8")))
+    mutate(document)
+
+    with pytest.raises(FixtureSchemaError):
+        decode_fixture(document)
+
+
+def test_generator_preserves_and_validates_full_contract_stage_baselines() -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "full_contract_case.json"
+    source = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    generated = generate_python_fixture.generate_fixture(source)
+
+    assert generated["cases"][0]["expected"]["tensors"] == source["cases"][0]["expected"]["tensors"]
+    assert generated["cases"][0]["expected"]["semantic_tokens"] == source["cases"][0]["expected"]["semantic_tokens"]
 
 
 @pytest.mark.parametrize(
@@ -186,7 +236,7 @@ def test_full_contract_fixture_validates_all_parity_boundaries() -> None:
             {"timing": {"stages": [{"name": "frontend", "elapsed_ms": "12"}]}}
         ),
         lambda document: document["cases"][0]["expected"]["tensors"][
-            "roberta_features"
+            "reference_pcm"
         ].pop("sha256"),
         lambda document: document["cases"][0]["expected"]["semantic_tokens"].update(
             {"values": [True, 2]}

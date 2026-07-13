@@ -53,28 +53,36 @@ def load_chinese_to_phones() -> Callable[[str], tuple[str, list[str], list[int],
 
 
 def generate_fixture(source: dict[str, Any]) -> dict[str, Any]:
-    """Run the Python frontend for each source case without loading model weights."""
+    """Generate frontend data and normalize an existing full-contract baseline.
+
+    This generator never creates model outputs. Full-contract sources must provide
+    their own complete stage baseline, which is preserved and revalidated.
+    """
     decode_fixture(source)
     chinese_to_phones = load_chinese_to_phones()
 
     generated_cases = []
     for case in source["cases"]:
         normalized_text, phones, phone_ids, word2ph = chinese_to_phones(case["input_text"])
+        frontend_expected = {
+            "normalized_text": normalized_text,
+            "phones": phones,
+            "phone_ids": serialize_integer_tensor(
+                shape=(1, len(phone_ids)),
+                values=phone_ids,
+            ),
+            "word2ph": serialize_integer_tensor(
+                shape=(len(word2ph),),
+                values=word2ph,
+            ),
+        }
+        expected = frontend_expected
+        if source["fixture_type"] == "genie_tts_parity_contract":
+            expected = {**case["expected"], **frontend_expected}
         generated_cases.append(
             {
                 **case,
-                "expected": {
-                    "normalized_text": normalized_text,
-                    "phones": phones,
-                    "phone_ids": serialize_integer_tensor(
-                        shape=(1, len(phone_ids)),
-                        values=phone_ids,
-                    ),
-                    "word2ph": serialize_integer_tensor(
-                        shape=(len(word2ph),),
-                        values=word2ph,
-                    ),
-                },
+                "expected": expected,
             }
         )
     generated = {**source, "cases": generated_cases}

@@ -13,16 +13,15 @@
         "word2ph": {"dtype": "int64", "shape": [3], "values": [2, 2, 1]},
         "semantic_tokens": {"dtype": "int64", "shape": [1, 2], "values": [-2147483648, 2147483647]},
         "tensors": {
-          "roberta_features": {
-            "dtype": "float32",
-            "shape": [1, 2],
-            "sha256": "937d530fa41fcbc6164988a1952b69213dc6b6f9cdb8a939027135cf9979a710",
-            "statistics": {"finite_count": 2, "non_finite_count": 0, "min": 0.0, "max": 1.5, "mean": 0.75}
-          },
-          "bert_phone_ids": {"dtype": "int64", "shape": [1, 2], "values": [7, 11]}
+          "reference_pcm": {"dtype": "float32", "shape": [1, 3], "sha256": "831abcaa2f5e86e35e2cae1287ec4920e504cc71c88311711907790974cb2340", "statistics": {"finite_count": 3, "non_finite_count": 0, "min": -0.25, "max": 0.25, "mean": 0.0}},
+          "hubert_features": {"dtype": "float32", "shape": [1, 1, 2], "sha256": "deea3b24add66f9c401d38a758eb5cb664db0596a3113b5ceaf8c5e774faa321", "statistics": {"finite_count": 2, "non_finite_count": 0, "min": -0.5, "max": 0.5, "mean": 0.0}},
+          "speaker_embedding": {"dtype": "float32", "shape": [1, 2], "sha256": "92b6f94629f38e441dadd29d7581aa2901cf48a9371d03dd74972b1a75eb9239", "statistics": {"finite_count": 2, "non_finite_count": 0, "min": 0.125, "max": 0.875, "mean": 0.5}},
+          "prompt_conditioning": {"dtype": "float32", "shape": [1, 2], "sha256": "c1112024d84bac179cfda8df2d45cdb8cb941ec29f75e8cffa61c3b4c46d44a1", "statistics": {"finite_count": 2, "non_finite_count": 0, "min": -1.0, "max": 1.0, "mean": 0.0}},
+          "t2s_output": {"dtype": "float32", "shape": [1, 2], "sha256": "12fd9cd6d428abc90edd16094e92fc22d8f3aec59612305236f1f1398701dc1c", "statistics": {"finite_count": 2, "non_finite_count": 0, "min": -0.75, "max": 0.75, "mean": 0.0}},
+          "vocoder_output": {"dtype": "float32", "shape": [1, 3], "sha256": "c558551342e73de3ddda6ba533c8fc25a73e6e691d0e0f3301ed7c0921873b53", "statistics": {"finite_count": 3, "non_finite_count": 0, "min": -0.2, "max": 0.3, "mean": 0.06666666666666667}}
         },
-        "timing": {"stages": [{"name": "frontend", "elapsed_ms": 12}]},
-        "trace": [{"model_role": "frontend", "provider": "cpu", "tensor_shape": [1, 2], "cache_status": "n/a", "elapsed_ms": 12}]
+        "timing": {"stages": [{"name": "frontend", "elapsed_ms": 12}, {"name": "hubert", "elapsed_ms": 3}, {"name": "speaker_encoder", "elapsed_ms": 2}, {"name": "prompt_encoder", "elapsed_ms": 2}, {"name": "t2s", "elapsed_ms": 4}, {"name": "vocoder", "elapsed_ms": 3}]},
+        "trace": [{"model_role": "frontend", "provider": "cpu", "tensor_shape": [1, 5], "cache_status": "n/a", "elapsed_ms": 12}, {"model_role": "hubert", "provider": "cpu", "tensor_shape": [1, 1, 2], "cache_status": "miss", "elapsed_ms": 3}, {"model_role": "speaker_encoder", "provider": "cpu", "tensor_shape": [1, 2], "cache_status": "miss", "elapsed_ms": 2}, {"model_role": "prompt_encoder", "provider": "cpu", "tensor_shape": [1, 2], "cache_status": "miss", "elapsed_ms": 2}, {"model_role": "t2s", "provider": "cpu", "tensor_shape": [1, 2], "cache_status": "n/a", "elapsed_ms": 4}, {"model_role": "vocoder", "provider": "cpu", "tensor_shape": [1, 3], "cache_status": "n/a", "elapsed_ms": 3}]
       }
     }
   ]

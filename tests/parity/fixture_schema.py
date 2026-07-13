@@ -15,6 +15,23 @@ _SUPPORTED_FIXTURE_TYPES = {"chinese_frontend", "genie_tts_parity_contract"}
 _REQUIRED_CASE_KEYS = {"id", "category", "input_text"}
 _REQUIRED_FRONTEND_KEYS = {"normalized_text", "phones", "phone_ids", "word2ph"}
 _OPTIONAL_EXPECTED_KEYS = {"tensors", "semantic_tokens", "timing", "trace"}
+_FULL_CONTRACT_REQUIRED_KEYS = {"tensors", "semantic_tokens", "timing", "trace"}
+_FULL_CONTRACT_TENSORS = {
+    "reference_pcm",
+    "hubert_features",
+    "speaker_embedding",
+    "prompt_conditioning",
+    "t2s_output",
+    "vocoder_output",
+}
+_FULL_CONTRACT_TRACE_ROLES = {
+    "frontend",
+    "hubert",
+    "speaker_encoder",
+    "prompt_encoder",
+    "t2s",
+    "vocoder",
+}
 _INTEGER_DTYPES = {"int32", "int64"}
 _FLOAT_DTYPES = {"float32"}
 _MODEL_ROLES = {
@@ -110,13 +127,13 @@ def _validate_case(case: Any, case_ids: set[str], fixture_type: str) -> None:
 
     expected = case.get("expected")
     if expected is not None:
-        _validate_expected(expected)
+        _validate_expected(expected, full_contract=fixture_type == "genie_tts_parity_contract")
     elif fixture_type == "genie_tts_parity_contract":
         raise FixtureSchemaError("Full parity contract cases must include expected data.")
     case_ids.add(case_id)
 
 
-def _validate_expected(expected: Any) -> None:
+def _validate_expected(expected: Any, *, full_contract: bool = False) -> None:
     if not isinstance(expected, Mapping):
         raise FixtureSchemaError("Case expected data must be an object.")
     missing = _REQUIRED_FRONTEND_KEYS.difference(expected)
@@ -145,7 +162,21 @@ def _validate_expected(expected: Any) -> None:
         _validate_timing(timing)
     trace = expected.get("trace")
     if trace is not None:
-        _validate_trace(trace)
+        trace_roles = _validate_trace(trace)
+    else:
+        trace_roles = set()
+    if full_contract:
+        missing_contract = _FULL_CONTRACT_REQUIRED_KEYS.difference(expected)
+        if missing_contract:
+            raise FixtureSchemaError(
+                f"Full parity contract expected data is missing {sorted(missing_contract)}."
+            )
+        if set(tensors) != _FULL_CONTRACT_TENSORS:
+            raise FixtureSchemaError("Full parity contract tensors must record every required boundary.")
+        if any(tensors[name].get("dtype") != "float32" for name in _FULL_CONTRACT_TENSORS):
+            raise FixtureSchemaError("Full parity contract boundary tensors must be float32.")
+        if trace_roles != _FULL_CONTRACT_TRACE_ROLES:
+            raise FixtureSchemaError("Full parity contract trace must record every required model role.")
 
 
 def _validate_named_tensors(tensors: Any) -> None:
@@ -242,11 +273,12 @@ def _validate_timing(timing: Any) -> None:
             raise FixtureSchemaError("Timing elapsed_ms must be a non-negative integer.")
 
 
-def _validate_trace(trace: Any) -> None:
+def _validate_trace(trace: Any) -> set[str]:
     allowed = {"model_role", "provider", "tensor_shape", "cache_status", "elapsed_ms"}
     required = {"model_role", "provider"}
     if not isinstance(trace, list) or not trace:
         raise FixtureSchemaError("expected.trace must be a non-empty array.")
+    roles: set[str] = set()
     for record in trace:
         if not isinstance(record, Mapping) or not required.issubset(record):
             raise FixtureSchemaError("Each trace record must include model_role and provider.")
@@ -265,6 +297,8 @@ def _validate_trace(trace: Any) -> None:
             type(record["elapsed_ms"]) is not int or record["elapsed_ms"] < 0
         ):
             raise FixtureSchemaError("Trace elapsed_ms must be a non-negative integer.")
+        roles.add(record["model_role"])
+    return roles
 
 
 def _validate_integer_values(values: Any) -> list[int]:
