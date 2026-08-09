@@ -8,4 +8,5 @@ data class GenerationRequest(
     val referenceAudioPath: String,
     val referenceText: String,
     val maxDecoderSteps: Int = 500,
+    val auxiliaryReferenceAudioPaths: List<String> = emptyList(),
 )

@@ -78,6 +78,10 @@ class ModelAssetRepository private constructor(
         }
 
         val present = targetDirectory.list()?.toSet().orEmpty()
+        val hasPromptFp16Manifest = File(
+            targetDirectory,
+            Fp16ExternalInitializers.MANIFEST_FILE,
+        ).isFile
 
         requiredModelFiles.files.forEach { fileName ->
             val targetFile = File(targetDirectory, fileName)
@@ -85,6 +89,14 @@ class ModelAssetRepository private constructor(
 
             val derivedFile = requiredModelFiles.derivedFiles.firstOrNull { it.outputFile == fileName }
             if (derivedFile != null) {
+                if (
+                    hasPromptFp16Manifest &&
+                        derivedFile.outputFile == "prompt_encoder_fp32.bin"
+                ) {
+                    // ORT receives these prompt weights through external
+                    // initializers; do not materialize the FP32 fallback.
+                    return@forEach
+                }
                 val sourceFile = File(targetDirectory, derivedFile.sourceFile)
                 if (sourceFile.exists()) {
                     HalfPrecisionFileConverter.convertFp16FileToFp32File(sourceFile, targetFile)
@@ -111,26 +123,24 @@ class ModelAssetRepository private constructor(
         val promptJson = File(characterRoot, "prompt_wav.json")
         val promptDirectory = File(characterRoot, "prompt_wav")
 
-        if (promptJson.exists()) {
-            val (wav, text) = readNormalPromptFields(promptJson.readText()) ?: ("" to null)
-            if (wav.isNotBlank() && text != null) {
-                val audioFile = File(promptDirectory, wav)
-                if (audioFile.exists()) {
-                    return ReferenceExample(audioFile = audioFile, referenceText = text)
-                }
-            }
+        require(promptJson.isFile) {
+            "${promptJson.absolutePath} is required to select the Normal reference."
         }
 
-        val wavFile = promptDirectory
-            .listFiles()
-            ?.filter { it.isFile && it.extension.equals("wav", ignoreCase = true) }
-            ?.sortedBy { it.name }
-            ?.firstOrNull()
-            ?: return null
-        return ReferenceExample(
-            audioFile = wavFile,
-            referenceText = referenceTextFromFilename(wavFile.nameWithoutExtension),
-        )
+        val normal = readNormalPromptFields(promptJson.readText())
+            ?: throw IllegalArgumentException(
+                "${promptJson.name} must contain a valid Normal reference object.",
+            )
+        val wav = normal.first.trim()
+        val text = normal.second
+        require(wav.isNotBlank() && text?.isNotBlank() == true) {
+            "${promptJson.name} Normal reference must contain wav and text."
+        }
+        val audioFile = File(promptDirectory, wav)
+        require(audioFile.isFile) {
+            "Normal reference audio is missing: ${audioFile.absolutePath}"
+        }
+        return ReferenceExample(audioFile = audioFile, referenceText = text)
     }
 
     private fun readNormalPromptFields(jsonText: String): Pair<String, String?>? {
@@ -145,17 +155,11 @@ class ModelAssetRepository private constructor(
         return runCatching { PromptJsonCursor(jsonText).readNormalFields() }.getOrNull()
     }
 
-    private fun referenceTextFromFilename(filename: String): String {
-        val trimmed = filename.trim()
-        val stripped = trimmed.substringAfter('-', trimmed)
-        return stripped.ifBlank { trimmed }
-    }
-
     private fun missingSessionModels(
         modelDirectory: File,
         requiredModelFiles: RequiredModelFiles,
     ): List<String> =
-        requiredModelFiles.sessionModels.filterNot { fileName ->
+        requiredModelFiles.sessionModelNames(modelDirectory).filterNot { fileName ->
             File(modelDirectory, fileName).exists()
         }
 

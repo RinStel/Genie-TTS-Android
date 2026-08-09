@@ -35,9 +35,7 @@ import dev.rinstel.genie_tts.inference.ExecutionBackend
 import dev.rinstel.genie_tts.inference.GenerationRequest
 import dev.rinstel.genie_tts.inference.GenerationStage
 import dev.rinstel.genie_tts.inference.ModelAssetRepository
-import dev.rinstel.genie_tts.inference.QnnRuntimeSupport
 import dev.rinstel.genie_tts.inference.RuntimeAssetRepository
-import dev.rinstel.genie_tts.inference.XnnpackRuntimeSupport
 import dev.rinstel.genie_tts.api.ActiveDefaults
 import java.io.File
 
@@ -51,10 +49,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var synthesisTextInput: TextInputEditText
     private lateinit var referenceSourceValue: TextView
     private lateinit var referenceAudioValue: TextView
+    private lateinit var auxiliaryReferenceValue: TextView
+    private lateinit var auxiliaryReferenceHintView: TextView
     private lateinit var referenceTextInput: TextInputEditText
     private lateinit var referenceHintView: TextView
     private lateinit var chooseReferenceButton: MaterialButton
     private lateinit var restoreReferenceButton: MaterialButton
+    private lateinit var chooseAuxiliaryButton: MaterialButton
+    private lateinit var clearAuxiliaryButton: MaterialButton
     private lateinit var decoderStepsValueView: TextView
     private lateinit var decoderStepsSlider: Slider
     private lateinit var playButton: MaterialButton
@@ -83,6 +85,14 @@ class MainActivity : AppCompatActivity() {
     private val pickReferenceAudio = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             handlePickedReferenceAudio(uri)
+        }
+    }
+
+    private val pickAuxiliaryReferenceAudio = registerForActivityResult(
+        ActivityResultContracts.GetMultipleContents(),
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            handlePickedAuxiliaryReferenceAudio(uris)
         }
     }
 
@@ -116,20 +126,7 @@ class MainActivity : AppCompatActivity() {
         modelRepository = ModelAssetRepository(this)
         runtimeRepository = RuntimeAssetRepository(this)
         referenceAudioPicker = ReferenceAudioPicker(this)
-        val qnnInspection = QnnRuntimeSupport.inspect(this)
-        val xnnpackInspection = XnnpackRuntimeSupport.inspect()
-        backendOptions = BackendCatalog.build(
-            qnnAvailable = qnnInspection.available,
-            qnnStatus = qnnInspection.message,
-            // Keep XNNPACK wired for internal debugging and API development only.
-            // The main UI stays on CPU/QNN until XNN output parity is verified.
-            xnnpackAvailable = false,
-            xnnpackStatus = if (xnnpackInspection.available) {
-                "XNNPACK output parity is not verified."
-            } else {
-                xnnpackInspection.message
-            },
-        )
+        backendOptions = BackendCatalog.cpuOnly()
         modelOptions = modelRepository.discoverCharacterModels()
 
         bindViews()
@@ -140,6 +137,13 @@ class MainActivity : AppCompatActivity() {
         renderInitialState()
         requestNotificationPermissionIfNeeded()
         startAndBindBackendService()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::modelRepository.isInitialized && ::modelSelector.isInitialized) {
+            refreshModelOptions()
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -175,10 +179,14 @@ class MainActivity : AppCompatActivity() {
         synthesisTextInput = findViewById(R.id.synthesisTextInput)
         referenceSourceValue = findViewById(R.id.referenceSourceValue)
         referenceAudioValue = findViewById(R.id.referenceAudioValue)
+        auxiliaryReferenceValue = findViewById(R.id.auxiliaryReferenceValue)
+        auxiliaryReferenceHintView = findViewById(R.id.auxiliaryReferenceHintValue)
         referenceTextInput = findViewById(R.id.referenceTextInput)
         referenceHintView = findViewById(R.id.referenceHintValue)
         chooseReferenceButton = findViewById(R.id.chooseReferenceButton)
         restoreReferenceButton = findViewById(R.id.restoreReferenceButton)
+        chooseAuxiliaryButton = findViewById(R.id.chooseAuxiliaryButton)
+        clearAuxiliaryButton = findViewById(R.id.clearAuxiliaryButton)
         decoderStepsValueView = findViewById(R.id.decoderStepsValue)
         decoderStepsSlider = findViewById(R.id.decoderStepsSlider)
         playButton = findViewById(R.id.playButton)
@@ -209,10 +217,9 @@ class MainActivity : AppCompatActivity() {
             ArrayAdapter(this, android.R.layout.simple_list_item_1, backendOptions.map(BackendOption::label)),
         )
         backendSelector.setText(BackendCatalog.defaultOption(backendOptions).label, false)
-        backendSelector.setOnItemClickListener { _, _, _, _ ->
-            validateSelectedResources(showReady = false)
-            pushActiveDefaults()
-        }
+        // CPU is the only supported production backend; keep the field as a
+        // clear status value rather than exposing a misleading selector.
+        backendSelector.isEnabled = false
 
         modelSelector.setAdapter(
             ArrayAdapter(this, android.R.layout.simple_list_item_1, modelOptions.map(CharacterModel::displayName)),
@@ -253,6 +260,13 @@ class MainActivity : AppCompatActivity() {
         restoreReferenceButton.setOnClickListener {
             restoreDefaultReference(manualTrigger = true)
         }
+        chooseAuxiliaryButton.setOnClickListener {
+            pickAuxiliaryReferenceAudio.launch("audio/*")
+        }
+        clearAuxiliaryButton.setOnClickListener {
+            referenceInputState = referenceInputState.withAuxiliaryReferences(emptyList())
+            renderReferenceState()
+        }
         runButton.setOnClickListener {
             runGeneration()
         }
@@ -284,9 +298,45 @@ class MainActivity : AppCompatActivity() {
         pushActiveDefaults()
     }
 
+    private fun refreshModelOptions() {
+        val previousIds = modelOptions.map(CharacterModel::id)
+        val selectedId = selectedModelOrNull()?.id
+        val refreshed = modelRepository.discoverCharacterModels()
+        if (previousIds == refreshed.map(CharacterModel::id)) {
+            if (modelOptions.isNotEmpty()) {
+                // Re-read the default prompt after an in-place character update.
+                updateSelectedModelUi()
+            } else {
+                syncPathViews(selectedModel = null)
+            }
+            return
+        }
+
+        modelOptions = refreshed
+        modelSelector.setAdapter(
+            ArrayAdapter(this, android.R.layout.simple_list_item_1, modelOptions.map(CharacterModel::displayName)),
+        )
+        val selected = modelOptions.firstOrNull { it.id == selectedId } ?: modelOptions.firstOrNull()
+        modelSelector.setText(selected?.displayName.orEmpty(), false)
+        modelSelector.isEnabled = !lastServiceState.busy
+        if (selected != null) {
+            updateSelectedModelUi()
+        } else {
+            defaultReferenceState = ReferenceInputState.empty()
+            referenceInputState = ReferenceInputState.empty()
+            renderReferenceState()
+            syncPathViews(selectedModel = null)
+        }
+    }
+
     private fun loadDefaultReferenceForSelectedModel(manualTrigger: Boolean) {
         val selectedModel = selectedModelOrNull() ?: return
-        val example = modelRepository.findReferenceExample(selectedModel)
+        val example = runCatching {
+            modelRepository.findReferenceExample(selectedModel)
+        }.getOrElse { error ->
+            updateLocalStatus(error.message ?: getString(R.string.prototype_reference_missing))
+            null
+        }
         defaultReferenceState = example?.let { ref ->
             ReferenceInputState.defaultSample(
                 backendAudioPath = ref.audioFile.absolutePath,
@@ -339,9 +389,38 @@ class MainActivity : AppCompatActivity() {
             displayAudioName = picked.displayName,
             referenceText = referenceTextInput.text?.toString().orEmpty(),
             hint = picked.cachedFile.absolutePath,
+            auxiliaryReferences = referenceInputState.auxiliaryReferences,
         )
         renderReferenceState()
         updateLocalStatus(getString(R.string.prototype_reference_selected, picked.displayName))
+    }
+
+    private fun handlePickedAuxiliaryReferenceAudio(uris: List<Uri>) {
+        if (!supportsAuxiliaryReferences()) {
+            updateLocalStatus(getString(R.string.prototype_auxiliary_reference_unsupported))
+            return
+        }
+        val picked = runCatching {
+            uris.map { uri -> referenceAudioPicker.copyToAppCache(uri) }
+        }.getOrElse { error ->
+            updateLocalStatus(
+                getString(
+                    R.string.prototype_reference_pick_failed,
+                    error.message ?: error.javaClass.simpleName,
+                ),
+            )
+            return
+        }
+        referenceInputState = referenceInputState.withAuxiliaryReferences(
+            picked.map { audio ->
+                AuxiliaryReferenceAudio(
+                    backendAudioPath = audio.cachedFile.absolutePath,
+                    displayAudioName = audio.displayName,
+                )
+            },
+        )
+        renderReferenceState()
+        updateLocalStatus(getString(R.string.prototype_auxiliary_reference_selected, picked.size))
     }
 
     private fun renderReferenceState() {
@@ -358,11 +437,24 @@ class MainActivity : AppCompatActivity() {
         referenceHintView.text = referenceInputState.hint.ifBlank {
             getString(R.string.prototype_reference_hint_empty)
         }
+        val auxiliarySupported = supportsAuxiliaryReferences()
+        auxiliaryReferenceValue.text = referenceInputState.auxiliaryReferences
+            .mapIndexed { index, audio -> "${index + 1}. ${audio.displayAudioName}" }
+            .joinToString("\n")
+            .ifBlank { getString(R.string.prototype_auxiliary_reference_empty) }
+        auxiliaryReferenceHintView.text = if (auxiliarySupported) {
+            getString(R.string.prototype_auxiliary_reference_hint)
+        } else {
+            getString(R.string.prototype_auxiliary_reference_unsupported)
+        }
         suppressReferenceTextChanges = true
         referenceTextInput.setText(referenceInputState.referenceText)
         suppressReferenceTextChanges = false
         restoreReferenceButton.isEnabled = defaultReferenceState.isReady &&
             referenceInputState.source == ReferenceInputState.Source.MANUAL_OVERRIDE
+        chooseAuxiliaryButton.isEnabled = auxiliarySupported && !lastServiceState.busy
+        clearAuxiliaryButton.isEnabled = referenceInputState.auxiliaryReferences.isNotEmpty() &&
+            !lastServiceState.busy
         pushActiveDefaults()
     }
 
@@ -393,6 +485,10 @@ class MainActivity : AppCompatActivity() {
             updateLocalStatus(getString(R.string.prototype_reference_missing))
             return
         }
+        if (referenceInputState.auxiliaryReferences.isNotEmpty() && !supportsAuxiliaryReferences()) {
+            updateLocalStatus(getString(R.string.prototype_auxiliary_reference_unsupported))
+            return
+        }
 
         val request = GenerationRequest(
             characterModel = selectedModel,
@@ -402,6 +498,7 @@ class MainActivity : AppCompatActivity() {
             referenceAudioPath = referenceInputState.backendAudioPath,
             referenceText = referenceInputState.referenceText,
             maxDecoderSteps = decoderStepsSlider.value.toInt(),
+            auxiliaryReferenceAudioPaths = referenceInputState.auxiliaryReferences.map { it.backendAudioPath },
         )
         if (service.currentState().busy) {
             updateLocalStatus(getString(R.string.prototype_generation_busy), busy = true)
@@ -507,9 +604,11 @@ class MainActivity : AppCompatActivity() {
         renderProgress(lastServiceState)
         syncPathViews(outputPath = state.latestOutputFilePath)
         runButton.isEnabled = !state.busy
-        backendSelector.isEnabled = !state.busy
+        backendSelector.isEnabled = false
         modelSelector.isEnabled = !state.busy
         chooseReferenceButton.isEnabled = !state.busy
+        chooseAuxiliaryButton.isEnabled = !state.busy && supportsAuxiliaryReferences()
+        clearAuxiliaryButton.isEnabled = !state.busy && referenceInputState.auxiliaryReferences.isNotEmpty()
         restoreReferenceButton.isEnabled = !state.busy &&
             defaultReferenceState.isReady &&
             referenceInputState.source == ReferenceInputState.Source.MANUAL_OVERRIDE
@@ -565,8 +664,21 @@ class MainActivity : AppCompatActivity() {
                 referenceText = referenceInputState.referenceText,
                 maxDecoderSteps = decoderStepsSlider.value.toInt(),
                 promptLanguage = selectedPromptLanguage().value,
+                auxiliaryReferenceAudioPaths = referenceInputState.auxiliaryReferences.map { it.backendAudioPath },
             ),
         )
+    }
+
+    private fun supportsAuxiliaryReferences(): Boolean {
+        val selectedModel = selectedModelOrNull() ?: return false
+        if (selectedModel.modelFiles.maxAuxiliaryReferenceCount <= 0 ||
+            !selectedModel.modelFiles.optionalSessionModels.contains("prompt_encoder_multi_fp32.onnx")
+        ) return false
+        val modelDirectory = File(
+            modelRepository.modelRootDirectory(),
+            selectedModel.relativeModelDirectory,
+        )
+        return File(modelDirectory, "prompt_encoder_multi_fp32.onnx").isFile
     }
 
     private fun renderProgress(state: BackendServiceState) {

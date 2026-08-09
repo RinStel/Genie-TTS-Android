@@ -6,6 +6,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import java.io.File
 import java.nio.FloatBuffer
+import java.util.LinkedHashMap
 
 class OrtRuntimeFeatureExtractor(
     private val context: Context,
@@ -14,16 +15,57 @@ class OrtRuntimeFeatureExtractor(
     private val traceLogger: InferenceTraceLogger = InferenceTraceLogger.None,
     private val referenceCache: ReferenceConditioningCache = ReferenceConditioningCache(),
 ) : TtsInputPreparer, AutoCloseable {
+    private data class AuxiliaryReferenceCacheKey(
+        val audio: ReferenceAudioFingerprint,
+        val modelInterfaceVersion: String,
+        val preprocessingVersion: String,
+        val backend: ExecutionBackend,
+        val conditioningRole: InferenceModelRole,
+    )
+
+    private data class AuxiliaryReferenceConditioning(
+        val audio32k: FloatArray,
+        val speakerEmbedding: FloatTensorData,
+    )
+
     private val environment: OrtEnvironment by lazy(LazyThreadSafetyMode.NONE) {
         OrtEnvironment.getEnvironment()
     }
     private var hubertSession: OrtSession? = null
+    private var hubertExternalInitializers: Fp16ExternalInitializers.Loaded? = null
     private var speakerSession: OrtSession? = null
+    private val auxiliaryReferenceCache = object : LinkedHashMap<AuxiliaryReferenceCacheKey, AuxiliaryReferenceConditioning>(
+        AUXILIARY_REFERENCE_CACHE_CAPACITY,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<AuxiliaryReferenceCacheKey, AuxiliaryReferenceConditioning>,
+        ): Boolean = size > AUXILIARY_REFERENCE_CACHE_CAPACITY
+    }
+    private val promptConditioningCache = PromptConditioningCache()
 
     private val robertaProvider: RobertaFeatureProvider? by lazy(LazyThreadSafetyMode.NONE) {
-        RobertaFeatureProvider.tryCreate(environment, runtimeAssets.runtimeRoot()) { options ->
-            backend.applySessionOptions(options)
-        }
+        RobertaFeatureProvider.tryCreate(
+            environment = environment,
+            runtimeRoot = runtimeAssets.runtimeRoot(),
+            configureSessionOptions = { options ->
+                backend.applySessionOptions(options, InferenceModelRole.ROBERTA)
+            },
+            onSessionCreated = {
+                traceLogger.event(
+                    InferenceTraceEvent.Model(
+                        InferenceTraceRecord(
+                            modelRole = InferenceModelRole.ROBERTA,
+                            provider = ModelRoleSessionOptions.providerFor(
+                                backend.backend,
+                                InferenceModelRole.ROBERTA,
+                            ),
+                        ),
+                    ),
+                )
+            },
+        )
     }
 
     private val textFeatureExtractor: TextFeatureExtractor by lazy(LazyThreadSafetyMode.NONE) {
@@ -38,6 +80,16 @@ class OrtRuntimeFeatureExtractor(
         }
 
         val isV2ProPlus = backend.hasPromptEncoder()
+        val auxiliaryReferencePaths = canonicalAuxiliaryReferencePaths(request.auxiliaryReferenceAudioPaths)
+        if (auxiliaryReferencePaths.isNotEmpty()) {
+            require(isV2ProPlus) { "Auxiliary references require a V2ProPlus prompt encoder." }
+            val primaryReferencePath = canonicalReferencePath(request.referenceAudioPath)
+            require(auxiliaryReferencePaths.none { it == primaryReferencePath }) {
+                "Auxiliary reference path duplicates the primary reference."
+            }
+            requireNotNull(backend.multiReferenceCapability())
+                .validateAuxiliaryReferencePaths(auxiliaryReferencePaths)
+        }
         val normalizedPromptLanguage = LanguageNormalizer.normalize(request.promptLanguage)
         val textFeatures = timer.measure("text_features_ms") {
             textFeatureExtractor.extract(
@@ -45,23 +97,63 @@ class OrtRuntimeFeatureExtractor(
                 GenieTextConventions.prepareSynthesisText(request.language, request.synthesisText),
             )
         }
-        val cacheKey = referenceCacheKey(request, normalizedPromptLanguage, isV2ProPlus)
-        val cachedReference = referenceCache.get(cacheKey)
-        val reference = if (cachedReference != null) {
-            timer.event(InferenceTraceEvent.Cache(InferenceCacheStatus.HIT))
-            cachedReference
+        timer.event(
+            InferenceTraceEvent.Model(
+                InferenceTraceRecord(
+                    modelRole = InferenceModelRole.TEXT_FRONTEND,
+                    provider = InferenceProvider.CPU,
+                ),
+            ),
+        )
+        timer.event(
+            InferenceTraceEvent.TensorHash(
+                InferenceTensorMetric.TEXT_SEQ_HASH,
+                InferenceTraceHash.sha256(textFeatures.phoneIds.values),
+            ),
+        )
+        timer.traceFloatTensor(InferenceTensorMetric.TEXT_BERT_HASH, textFeatures.bert.values)
+        // Keep semantic/reference features independent from the ordered auxiliary bundle.
+        val primaryCacheKey = referenceCacheKey(request, normalizedPromptLanguage, isV2ProPlus)
+        val cachedPrimary = referenceCache.get(primaryCacheKey)
+        val promptCacheKey = if (isV2ProPlus) {
+            promptConditioningCacheKey(request, auxiliaryReferencePaths)
         } else {
-            timer.event(InferenceTraceEvent.Cache(InferenceCacheStatus.MISS))
+            null
+        }
+        val cachedPrompt = promptCacheKey?.let(promptConditioningCache::get)
+        val cacheHit = cachedPrimary != null && (!isV2ProPlus || cachedPrompt != null)
+        timer.event(
+            InferenceTraceEvent.Cache(
+                if (cacheHit) InferenceCacheStatus.HIT else InferenceCacheStatus.MISS,
+            ),
+        )
+        if (!cacheHit) {
             runtimeAssets.prepareRuntimeWeights()
             ensureSessions(needsSpeakerEncoder = isV2ProPlus)
-            referenceCache.getOrPut(cacheKey) {
-                computeReferenceConditioning(
-                    request = request,
-                    normalizedPromptLanguage = normalizedPromptLanguage,
-                    isV2ProPlus = isV2ProPlus,
+        }
+        val primary = cachedPrimary ?: referenceCache.getOrPut(primaryCacheKey) {
+            computePrimaryReferenceConditioning(
+                request = request,
+                normalizedPromptLanguage = normalizedPromptLanguage,
+                isV2ProPlus = isV2ProPlus,
+                timer = timer,
+            )
+        }
+        val reference = if (!isV2ProPlus) {
+            primary
+        } else {
+            val prompt = cachedPrompt ?: promptConditioningCache.getOrPut(requireNotNull(promptCacheKey)) {
+                computePromptConditioning(
+                    primary = primary,
+                    auxiliaryReferencePaths = auxiliaryReferencePaths,
+                    modelInterfaceVersion = modelInterfaceVersion(request.characterModel),
                     timer = timer,
                 )
             }
+            primary.copy(
+                globalEmbedding = prompt.globalEmbedding,
+                advancedGlobalEmbedding = prompt.advancedGlobalEmbedding,
+            )
         }
 
         return reference.toPreparedInput(textFeatures)
@@ -70,23 +162,60 @@ class OrtRuntimeFeatureExtractor(
     private fun ensureSessions(needsSpeakerEncoder: Boolean) {
         if (hubertSession == null) {
             val options = OrtSession.SessionOptions()
-            backend.applySessionOptions(options)
-            hubertSession = environment.createSession(
-                runtimeAssets.hubertModelFile().absolutePath, options
+            try {
+                backend.applySessionOptions(options, InferenceModelRole.HUBERT)
+                hubertExternalInitializers = Fp16ExternalInitializers.loadOrNull(
+                    environment = environment,
+                    modelDirectory = requireNotNull(runtimeAssets.hubertModelFile().parentFile),
+                    manifestFileName = Fp16ExternalInitializers.HUBERT_MANIFEST_FILE,
+                    defaultWeightFile = "chinese-hubert-base_weights_fp16.bin",
+                )
+                hubertExternalInitializers?.let { options.addExternalInitializers(it.values) }
+                hubertSession = environment.createSession(
+                    runtimeAssets.hubertModelFile().absolutePath, options
+                )
+            } finally {
+                options.close()
+            }
+            traceLogger.event(
+                InferenceTraceEvent.Model(
+                    InferenceTraceRecord(
+                        modelRole = InferenceModelRole.HUBERT,
+                        provider = ModelRoleSessionOptions.providerFor(
+                            backend.backend,
+                            InferenceModelRole.HUBERT,
+                        ),
+                    ),
+                ),
             )
             OrtCpuBackend.warmUpSession(environment, hubertSession!!)
         }
         if (needsSpeakerEncoder && speakerSession == null) {
             val options = OrtSession.SessionOptions()
-            backend.applySessionOptions(options)
-            speakerSession = environment.createSession(
-                runtimeAssets.speakerEncoderFile().absolutePath, options
+            try {
+                backend.applySessionOptions(options, InferenceModelRole.SPEAKER_ENCODER)
+                speakerSession = environment.createSession(
+                    runtimeAssets.speakerEncoderFile().absolutePath, options
+                )
+            } finally {
+                options.close()
+            }
+            traceLogger.event(
+                InferenceTraceEvent.Model(
+                    InferenceTraceRecord(
+                        modelRole = InferenceModelRole.SPEAKER_ENCODER,
+                        provider = ModelRoleSessionOptions.providerFor(
+                            backend.backend,
+                            InferenceModelRole.SPEAKER_ENCODER,
+                        ),
+                    ),
+                ),
             )
             OrtCpuBackend.warmUpSession(environment, speakerSession!!)
         }
     }
 
-    private fun computeReferenceConditioning(
+    private fun computePrimaryReferenceConditioning(
         request: GenerationRequest,
         normalizedPromptLanguage: String,
         isV2ProPlus: Boolean,
@@ -95,45 +224,129 @@ class OrtRuntimeFeatureExtractor(
         val refFeatures = timer.measure("reference_text_features_ms") {
             textFeatureExtractor.extract(normalizedPromptLanguage, request.referenceText)
         }
+        timer.event(
+            InferenceTraceEvent.TensorHash(
+                InferenceTensorMetric.REF_SEQ_HASH,
+                InferenceTraceHash.sha256(refFeatures.phoneIds.values),
+            ),
+        )
+        timer.traceFloatTensor(InferenceTensorMetric.REF_BERT_HASH, refFeatures.bert.values)
         val refAudio32k = timer.measure("reference_audio_load_ms") {
             loadReferenceAudio(File(request.referenceAudioPath), 32000)
         }
+        timer.traceFloatTensor(InferenceTensorMetric.REFERENCE_AUDIO_HASH, refAudio32k)
         val refAudio16k = timer.measure("reference_audio_resample_16k_ms") {
-            WavAudioReader.resampleLinear(refAudio32k, 32000, 16000)
+            WavAudioReader.resample(refAudio32k, 32000, 16000)
         }
         val sslContent = timer.measure("hubert_ms") {
             runHubert(refAudio16k)
         }
+        timer.traceFloatTensor(InferenceTensorMetric.SSL_CONTENT_HASH, sslContent.values)
 
-        return if (isV2ProPlus) {
-            val svEmbedding = timer.measure("speaker_encoder_ms") {
-                runSpeakerEncoder(refAudio16k)
-            }
-            val promptEmbeddings = timer.measure("prompt_encoder_ms") {
-                backend.encodePrompt(refAudio32k, svEmbedding)
-            }
-            ReferenceConditioning(
-                refSeq = refFeatures.phoneIds,
-                refBert = refFeatures.bert,
-                sslContent = sslContent,
-                globalEmbedding = promptEmbeddings.globalEmbedding,
-                advancedGlobalEmbedding = promptEmbeddings.advancedGlobalEmbedding,
-                refAudio32k = null,
-            )
+        val zeroEmb = FloatTensorData(FloatArray(0), longArrayOf(0L))
+        val refAudioTensor = if (isV2ProPlus) {
+            null
         } else {
-            val refAudioTensor = FloatTensorData(
+            FloatTensorData(
                 values = refAudio32k,
                 shape = longArrayOf(1L, refAudio32k.size.toLong()),
             )
-            val zeroEmb = FloatTensorData(FloatArray(0), longArrayOf(0L))
-            ReferenceConditioning(
-                refSeq = refFeatures.phoneIds,
-                refBert = refFeatures.bert,
-                sslContent = sslContent,
-                globalEmbedding = zeroEmb,
-                advancedGlobalEmbedding = zeroEmb,
-                refAudio32k = refAudioTensor,
-            )
+        }
+        val primarySpeakerEmbedding = if (isV2ProPlus) {
+            timer.measure("speaker_encoder_ms") {
+                runSpeakerEncoder(refAudio16k)
+            }
+        } else {
+            null
+        }
+        return ReferenceConditioning(
+            refSeq = refFeatures.phoneIds,
+            refBert = refFeatures.bert,
+            sslContent = sslContent,
+            globalEmbedding = zeroEmb,
+            advancedGlobalEmbedding = zeroEmb,
+            refAudio32k = refAudioTensor,
+            primaryAudio32k = refAudio32k,
+            primaryAudio16k = refAudio16k,
+            primarySpeakerEmbedding = primarySpeakerEmbedding,
+        )
+    }
+
+    private fun computePromptConditioning(
+        primary: ReferenceConditioning,
+        auxiliaryReferencePaths: List<String>,
+        modelInterfaceVersion: String,
+        timer: InferenceTimer,
+    ): PromptEmbeddings {
+        timer.traceFloatTensor(
+            speakerEmbeddingMetric(0),
+            requireNotNull(primary.primarySpeakerEmbedding).values,
+        )
+        val promptEmbeddings = if (auxiliaryReferencePaths.isEmpty()) {
+            timer.measure("prompt_encoder_ms") {
+                backend.encodePrompt(
+                    requireNotNull(primary.primaryAudio32k),
+                    requireNotNull(primary.primarySpeakerEmbedding),
+                )
+            }
+        } else {
+            val auxiliaryConditioning = auxiliaryReferencePaths.mapIndexed { index, path ->
+                loadAuxiliaryReference(path, modelInterfaceVersion).also { conditioning ->
+                    timer.traceFloatTensor(
+                        speakerEmbeddingMetric(index + 1),
+                        conditioning.speakerEmbedding.values,
+                    )
+                }
+            }
+            val referenceAudio32k = buildList {
+                add(requireNotNull(primary.primaryAudio32k))
+                addAll(auxiliaryConditioning.map(AuxiliaryReferenceConditioning::audio32k))
+            }
+            val speakerEmbeddings = buildList {
+                add(requireNotNull(primary.primarySpeakerEmbedding))
+                addAll(auxiliaryConditioning.map(AuxiliaryReferenceConditioning::speakerEmbedding))
+            }
+            timer.measure("prompt_encoder_ms") {
+                backend.encodePromptBatch(
+                    referenceAudio32k = referenceAudio32k,
+                    speakerEmbeddings = speakerEmbeddings,
+                )
+            }
+        }
+        timer.traceFloatTensor(
+            InferenceTensorMetric.GLOBAL_EMBEDDING_HASH,
+            promptEmbeddings.globalEmbedding.values,
+        )
+        timer.traceFloatTensor(
+            InferenceTensorMetric.ADVANCED_GLOBAL_EMBEDDING_HASH,
+            promptEmbeddings.advancedGlobalEmbedding.values,
+        )
+        return promptEmbeddings
+    }
+
+    // Keep each reference slot distinguishable from the Python parity trace.
+    private fun speakerEmbeddingMetric(referenceIndex: Int): InferenceTensorMetricName =
+        NamedInferenceTensorMetric("speaker_embedding_${referenceIndex}_hash")
+
+    private fun loadAuxiliaryReference(
+        path: String,
+        modelInterfaceVersion: String,
+    ): AuxiliaryReferenceConditioning {
+        val cacheKey = AuxiliaryReferenceCacheKey(
+            audio = referenceAudioFingerprint(path),
+            modelInterfaceVersion = modelInterfaceVersion,
+            preprocessingVersion = REFERENCE_PREPROCESSING_VERSION,
+            backend = backend.backend,
+            conditioningRole = InferenceModelRole.SPEAKER_ENCODER,
+        )
+        auxiliaryReferenceCache[cacheKey]?.let { return it }
+        val audio32k = loadReferenceAudio(File(cacheKey.audio.canonicalPath), 32000)
+        val audio16k = WavAudioReader.resample(audio32k, 32000, 16000)
+        return AuxiliaryReferenceConditioning(
+            audio32k = audio32k,
+            speakerEmbedding = runSpeakerEncoder(audio16k),
+        ).also { conditioning ->
+            auxiliaryReferenceCache[cacheKey] = conditioning
         }
     }
 
@@ -147,13 +360,80 @@ class OrtRuntimeFeatureExtractor(
             backend = backend.backend,
             language = normalizedPromptLanguage,
             referenceAudioPath = canonicalReferencePath(request.referenceAudioPath),
+            referenceAudioSize = File(request.referenceAudioPath)
+                .takeIf(File::exists)
+                ?.length()
+                ?: -1L,
+            referenceAudioLastModified = File(request.referenceAudioPath)
+                .takeIf(File::exists)
+                ?.lastModified()
+                ?: -1L,
             referenceText = request.referenceText,
             usesPromptEncoder = isV2ProPlus,
+            modelInterfaceVersion = modelInterfaceVersion(request.characterModel),
+            preprocessingVersion = REFERENCE_PREPROCESSING_VERSION,
+            conditioningRole = if (isV2ProPlus) {
+                InferenceModelRole.PROMPT_ENCODER
+            } else {
+                InferenceModelRole.VOCODER
+            },
         )
+
+    private fun promptConditioningCacheKey(
+        request: GenerationRequest,
+        auxiliaryReferencePaths: List<String>,
+    ): PromptConditioningCacheKey =
+        PromptConditioningCacheKey(
+            characterModelId = request.characterModel.id,
+            backend = backend.backend,
+            modelInterfaceVersion = modelInterfaceVersion(request.characterModel),
+            preprocessingVersion = REFERENCE_PREPROCESSING_VERSION,
+            conditioningRole = InferenceModelRole.PROMPT_ENCODER,
+            primaryReferenceAudio = referenceAudioFingerprint(request.referenceAudioPath),
+            auxiliaryReferenceAudioFingerprints = auxiliaryReferencePaths.map(::referenceAudioFingerprint),
+        )
+
+    private fun modelInterfaceVersion(characterModel: CharacterModel): String =
+        buildString {
+            append(characterModel.modelFiles.variantName)
+            append("|storage=")
+            append(characterModel.modelFiles.storageVersion)
+            append("|sessions=")
+            append(characterModel.modelFiles.sessionModels.joinToString(","))
+            append("|session_variants=")
+            append(
+                characterModel.modelFiles.sessionModelVariants.entries
+                    .sortedBy { it.key }
+                    .joinToString(",") { (base, variant) -> "$base->$variant" },
+            )
+            append("|optional_sessions=")
+            append(characterModel.modelFiles.optionalSessionModels.joinToString(","))
+        }
 
     private fun canonicalReferencePath(path: String): String {
         val file = File(path)
         return runCatching { file.canonicalPath }.getOrElse { file.absolutePath }
+    }
+
+    private fun canonicalAuxiliaryReferencePaths(paths: List<String>): List<String> {
+        val canonical = paths.map(::canonicalReferencePath)
+        require(canonical.none(String::isBlank)) { "Auxiliary reference paths cannot be blank." }
+        require(canonical.distinct().size == canonical.size) {
+            "Auxiliary reference paths must be unique."
+        }
+        canonical.forEach { path ->
+            require(File(path).isFile) { "Auxiliary reference audio not found: $path" }
+        }
+        return canonical
+    }
+
+    private fun referenceAudioFingerprint(path: String): ReferenceAudioFingerprint {
+        val file = File(canonicalReferencePath(path))
+        return ReferenceAudioFingerprint(
+            canonicalPath = file.absolutePath,
+            size = if (file.isFile) file.length() else -1L,
+            lastModified = if (file.isFile) file.lastModified() else -1L,
+        )
     }
 
     private fun ReferenceConditioning.toPreparedInput(textFeatures: TextFeatures): TtsPreparedInput =
@@ -170,7 +450,7 @@ class OrtRuntimeFeatureExtractor(
 
     private fun loadReferenceAudio(file: File, targetRate: Int): FloatArray {
         val decoded = MediaAudioDecoder.decodeMonoPcm(file) ?: WavAudioReader.readMonoPcm(file)
-        val resampled = WavAudioReader.resampleLinear(decoded.samples, decoded.sampleRate, targetRate)
+        val resampled = WavAudioReader.resample(decoded.samples, decoded.sampleRate, targetRate)
         return WavAudioReader.appendSilence(resampled, targetRate, 0.3f)
     }
 
@@ -200,10 +480,20 @@ class OrtRuntimeFeatureExtractor(
 
     override fun close() {
         hubertSession?.close()
+        hubertExternalInitializers?.close()
         speakerSession?.close()
         hubertSession = null
+        hubertExternalInitializers = null
         speakerSession = null
         referenceCache.clear()
+        promptConditioningCache.clear()
+        auxiliaryReferenceCache.clear()
         robertaProvider?.close()
+    }
+
+    companion object {
+        private const val REFERENCE_PREPROCESSING_VERSION =
+            "reference-conditioning-v2-soxr-hq-silence-0.3"
+        private const val AUXILIARY_REFERENCE_CACHE_CAPACITY = 8
     }
 }

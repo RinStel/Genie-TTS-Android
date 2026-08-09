@@ -4,9 +4,9 @@ object SemanticTokenSlicing {
     const val TERMINAL_TOKEN: Long = 0L
 
     /**
-     * Excludes the final decoder output from the completed generated tokens.
-     * That output is the decoder boundary whether it is EOS, a max-step value,
-     * or EOS already replaced with [terminalToken].
+     * Keeps the decoder's appended suffix and removes only special outputs.
+     * The stop flag is independent from the final token, so a normal token on
+     * the stopping step remains valid vocoder input.
      */
     fun completedTokens(
         decoderTokenOutputs: LongArray,
@@ -17,12 +17,14 @@ object SemanticTokenSlicing {
         if (count == 0) return longArrayOf()
 
         val firstCompleted = decoderTokenOutputs.size - count
-        val terminalIndex = decoderTokenOutputs.lastIndex
-        val completed = decoderTokenOutputs.copyOfRange(firstCompleted, terminalIndex + 1)
-        return if (completed.last() == terminalToken) {
-            completed.copyOf(completed.lastIndex)
-        } else {
-            completed.copyOf(completed.lastIndex)
+        var semantic = decoderTokenOutputs.copyOfRange(firstCompleted, decoderTokenOutputs.size)
+        val firstSpecialToken = semantic.indexOfFirst { it >= 1024L }
+        if (firstSpecialToken >= 0) {
+            semantic = semantic.copyOf(firstSpecialToken)
         }
+        if (semantic.isNotEmpty() && semantic.last() == terminalToken) {
+            semantic = semantic.copyOf(semantic.lastIndex)
+        }
+        return semantic
     }
 }

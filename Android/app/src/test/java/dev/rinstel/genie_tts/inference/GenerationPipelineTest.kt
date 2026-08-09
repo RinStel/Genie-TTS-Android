@@ -90,6 +90,8 @@ class GenerationPipelineTest {
                 "runtime_label" to "ORT QNN EP",
                 "audio_samples" to "3",
                 "audio_shape" to "[1, 1, 3]",
+                "audio_hash" to "831abcaa2f5e86e35e2cae1287ec4920e504cc71c88311711907790974cb2340",
+                "audio_stats" to "finite_count=3 non_finite_count=0 min=-0.25 max=0.25 mean=0",
             ),
             traceLogger.events.map { event ->
                 val parts = event.toLogLine().split(": ", limit = 2)

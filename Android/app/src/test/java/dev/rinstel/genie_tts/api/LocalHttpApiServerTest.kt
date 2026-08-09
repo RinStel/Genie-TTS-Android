@@ -6,11 +6,43 @@ import dev.rinstel.genie_tts.inference.CharacterModelCatalog
 import dev.rinstel.genie_tts.inference.ExecutionBackend
 import dev.rinstel.genie_tts.inference.GenerationRequest
 import java.io.File
+import java.net.ServerSocket
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LocalHttpApiServerTest {
+    @Test
+    fun startsOnConfiguredValidPort() {
+        val probe = ServerSocket(0)
+        val port = probe.localPort
+        probe.close()
+        val server = LocalHttpApiServer(FakeBridge())
+
+        try {
+            server.start(port)
+
+            val status = LocalHttpApiServer.currentStatus()
+            assertTrue(status.running)
+            assertEquals(port, status.port)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun rejectsPrivilegedPortBeforeAttemptingToBind() {
+        val server = LocalHttpApiServer(FakeBridge())
+
+        server.start(80)
+
+        val status = LocalHttpApiServer.currentStatus()
+        assertFalse(status.running)
+        assertTrue(status.lastError?.contains("between 1024 and 65535") == true)
+        server.stop()
+    }
+
     @Test
     fun inferMapsTextFieldIntoGenerationRequest() {
         val bridge = FakeBridge()
@@ -21,11 +53,11 @@ class LocalHttpApiServerTest {
             path = "/infer",
             body = """
                 {
-                  "backend": "QNN",
+                  "backend": "CPU",
                   "modelId": "mansui",
                   "language": "zh",
                   "text": "hello",
-                  "referenceAudioPath": "/tmp/ref.wav",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
                   "referenceText": "sample",
                   "maxDecoderSteps": 321
                 }
@@ -35,9 +67,174 @@ class LocalHttpApiServerTest {
         assertEquals(200, response.statusCode)
         assertEquals("audio/wav", response.contentType)
         assertTrue(response.binaryBody?.isNotEmpty() == true)
-        assertEquals(ExecutionBackend.QNN, bridge.capturedBackend)
+        assertEquals(ExecutionBackend.CPU, bridge.capturedBackend)
         assertEquals("hello", bridge.capturedRequest?.synthesisText)
         assertEquals(321, bridge.capturedRequest?.maxDecoderSteps)
+    }
+
+    @Test
+    fun inferPreservesAuxiliaryReferenceOrder() {
+        val bridge = FakeBridge()
+        val server = LocalHttpApiServer(bridge)
+        val first = File.createTempFile("aux-first", ".wav")
+        val second = File.createTempFile("aux-second", ".wav")
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "mansui",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
+                  "referenceText": "sample",
+                  "auxReferenceAudioPaths": ["${first.absolutePath.replace("\\", "\\\\")}", "${second.absolutePath.replace("\\", "\\\\")}"]
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(200, response.statusCode)
+        assertEquals(
+            listOf(first.absolutePath, second.absolutePath),
+            bridge.capturedRequest?.auxiliaryReferenceAudioPaths,
+        )
+        first.delete()
+        second.delete()
+    }
+
+    @Test
+    fun inferRejectsMissingAuxiliaryReferenceBeforeBackendCall() {
+        val bridge = FakeBridge()
+        val server = LocalHttpApiServer(bridge)
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "mansui",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
+                  "referenceText": "sample",
+                  "auxReferenceAudioPaths": ["/path/that/does/not/exist.wav"]
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(400, response.statusCode)
+        assertTrue(response.body.contains("not found"))
+        assertEquals(null, bridge.capturedRequest)
+    }
+
+    @Test
+    fun inferRejectsAuxiliaryReferenceThatDuplicatesPrimaryBeforeBackendCall() {
+        val bridge = FakeBridge()
+        val server = LocalHttpApiServer(bridge)
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "mansui",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
+                  "referenceText": "sample",
+                  "auxReferenceAudioPaths": ["${FakeBridge.primaryReferenceJsonPath}"]
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(400, response.statusCode)
+        assertTrue(response.body.contains("primary"))
+        assertEquals(null, bridge.capturedRequest)
+    }
+
+    @Test
+    fun inferRejectsMissingPrimaryReferenceBeforeBackendCall() {
+        val bridge = FakeBridge()
+        val server = LocalHttpApiServer(bridge)
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "mansui",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}.missing",
+                  "referenceText": "sample"
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(400, response.statusCode)
+        assertTrue(response.body.contains("Reference audio not found"))
+        assertEquals(null, bridge.capturedRequest)
+    }
+
+    @Test
+    fun inferRejectsNonPositiveDecoderStepsBeforeBackendCall() {
+        val bridge = FakeBridge()
+        val server = LocalHttpApiServer(bridge)
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "mansui",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
+                  "referenceText": "sample",
+                  "maxDecoderSteps": 0
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(400, response.statusCode)
+        assertTrue(response.body.contains("maxDecoderSteps must be positive"))
+        assertEquals(null, bridge.capturedRequest)
+    }
+
+    @Test
+    fun inferRejectsAuxiliaryReferencesForLegacyModelBeforeBackendCall() {
+        val bridge = FakeBridge(
+            models = CharacterModelCatalog.v2FromCharacterIds(listOf("legacy")),
+        )
+        val server = LocalHttpApiServer(bridge)
+        val auxiliary = File.createTempFile("aux-legacy", ".wav")
+
+        val response = server.handleRequestForTest(
+            method = "POST",
+            path = "/infer",
+            body = """
+                {
+                  "backend": "CPU",
+                  "modelId": "legacy",
+                  "language": "zh",
+                  "text": "hello",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
+                  "referenceText": "sample",
+                  "auxReferenceAudioPaths": ["${auxiliary.absolutePath.replace(File.separatorChar, '/')}"]
+                }
+            """.trimIndent(),
+        )
+
+        assertEquals(400, response.statusCode)
+        assertTrue(response.body, response.body.contains("does not support"))
+        assertEquals(null, bridge.capturedRequest)
+        auxiliary.delete()
     }
 
     @Test
@@ -55,7 +252,7 @@ class LocalHttpApiServerTest {
                   "language": "en",
                   "promptLanguage": "zh",
                   "text": "hello",
-                  "referenceAudioPath": "/tmp/ref.wav",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
                   "referenceText": "你好"
                 }
             """.trimIndent(),
@@ -80,7 +277,7 @@ class LocalHttpApiServerTest {
                   "modelId": "mansui",
                   "language": "ja",
                   "text": "こんにちは",
-                  "referenceAudioPath": "/tmp/ref.wav",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
                   "referenceText": "参考テキスト"
                 }
             """.trimIndent(),
@@ -104,7 +301,7 @@ class LocalHttpApiServerTest {
     @Test
     fun inferRejectsBackendThatIsNotEnabled() {
         val bridge = FakeBridge(
-            enabledBackends = setOf(ExecutionBackend.CPU, ExecutionBackend.QNN),
+            enabledBackends = setOf(ExecutionBackend.CPU),
         )
         val server = LocalHttpApiServer(bridge)
 
@@ -117,7 +314,7 @@ class LocalHttpApiServerTest {
                   "modelId": "mansui",
                   "language": "zh",
                   "text": "hello",
-                  "referenceAudioPath": "/tmp/ref.wav",
+                  "referenceAudioPath": "${FakeBridge.primaryReferenceJsonPath}",
                   "referenceText": "sample"
                 }
             """.trimIndent(),
@@ -144,7 +341,7 @@ class LocalHttpApiServerTest {
         assertEquals(ExecutionBackend.CPU, bridge.capturedBackend)
         assertEquals("hello world", bridge.capturedRequest?.synthesisText)
         assertEquals("mansui", bridge.capturedRequest?.characterModel?.id)
-        assertEquals("/tmp/ref.wav", bridge.capturedRequest?.referenceAudioPath)
+        assertEquals(FakeBridge.primaryReferencePath, bridge.capturedRequest?.referenceAudioPath)
         assertEquals("sample", bridge.capturedRequest?.referenceText)
         assertEquals("zh", bridge.capturedRequest?.language)
     }
@@ -157,7 +354,7 @@ class LocalHttpApiServerTest {
                 modelId = "mansui",
                 language = "en",
                 promptLanguage = "zh",
-                referenceAudioPath = "/tmp/ref.wav",
+                referenceAudioPath = FakeBridge.primaryReferencePath,
                 referenceText = "sample",
                 maxDecoderSteps = 500,
             ),
@@ -176,17 +373,24 @@ class LocalHttpApiServerTest {
     }
 
     private class FakeBridge(
-        private val enabledBackends: Set<ExecutionBackend> = ExecutionBackend.entries.toSet(),
+        private val enabledBackends: Set<ExecutionBackend> = setOf(ExecutionBackend.CPU),
+        private val models: List<CharacterModel> = CharacterModelCatalog.v2ProPlusFromCharacterIds(listOf("mansui")),
         private val defaults: ActiveDefaults = ActiveDefaults(
             backend = ExecutionBackend.CPU,
             modelId = "mansui",
             language = "zh",
-            referenceAudioPath = "/tmp/ref.wav",
+            referenceAudioPath = FakeBridge.primaryReferencePath,
             referenceText = "sample",
             maxDecoderSteps = 500,
         ),
     ) : LocalHttpApiServer.Bridge {
-        private val models = CharacterModelCatalog.v2ProPlusFromCharacterIds(listOf("mansui"))
+        companion object {
+            val primaryReferencePath: String = File.createTempFile("genie-primary", ".wav").apply {
+                writeBytes(byteArrayOf(0))
+                deleteOnExit()
+            }.absolutePath
+            val primaryReferenceJsonPath: String = primaryReferencePath.replace(File.separatorChar, '/')
+        }
 
         var capturedBackend: ExecutionBackend? = null
         var capturedRequest: GenerationRequest? = null

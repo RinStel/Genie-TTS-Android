@@ -13,17 +13,26 @@ import java.io.File
 import java.lang.reflect.Array
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
+import java.nio.ShortBuffer
 
 class OrtCpuBackend(
     override val backend: ExecutionBackend = ExecutionBackend.CPU,
     private val configureSessionOptions: (OrtSession.SessionOptions) -> Unit = {},
     private val traceLogger: InferenceTraceLogger = InferenceTraceLogger.None,
+    private val configureRoleSessionOptions: ((OrtSession.SessionOptions, InferenceModelRole) -> Unit)? = null,
+    // Current CPU device measurements favor the FP32 shells. Keep the FP16
+    // path available for explicit device-specific experiments.
+    private val preferFp16Graphs: Boolean = false,
 ) : InferenceBackend, PreparedTtsBackend {
 
     private val environment: OrtEnvironment by lazy(LazyThreadSafetyMode.NONE) {
         OrtEnvironment.getEnvironment()
     }
     private val sessions: MutableMap<String, OrtSession> = linkedMapOf()
+
+    // Reuse one in-memory FP16 -> FP32 initializer set for the legacy and
+    // multi-reference prompt sessions.
+    private var promptExternalInitializers: Fp16ExternalInitializers.Loaded? = null
 
     @Volatile
     internal var runtimeCallbacks: BackendRuntimeCallbacks? = null
@@ -32,6 +41,14 @@ class OrtCpuBackend(
 
     fun hasPromptEncoder(): Boolean =
         sessions.keys.any { it.contains("prompt_encoder", ignoreCase = true) }
+
+    fun multiReferenceCapability(): MultiReferenceCapability? {
+        if (!hasPromptEncoder()) return null
+        val multiReferenceSession = sessions[MULTI_REFERENCE_PROMPT_ENCODER] ?: return MultiReferenceCapability(
+            supported = false,
+        )
+        return MultiReferenceCapability.fromSession(multiReferenceSession)
+    }
 
     data class CpuThreadPlan(
         val intraOpThreads: Int,
@@ -42,16 +59,49 @@ class OrtCpuBackend(
         configureSessionOptions(options)
     }
 
+    fun applySessionOptions(
+        options: OrtSession.SessionOptions,
+        role: InferenceModelRole,
+    ) {
+        configureRoleSessionOptions?.invoke(options, role) ?: configureSessionOptions(options)
+    }
+
     override fun initialize(modelRoot: File, characterModel: CharacterModel): SessionSummary {
         close()
 
-        val options = OrtSession.SessionOptions()
-        configureSessionOptions(options)
         val modelDirectory = File(modelRoot, characterModel.relativeModelDirectory)
-        for (modelName in characterModel.modelFiles.sessionModels) {
+        val sessionModelNames = characterModel.modelFiles.sessionModelNames(
+            modelDirectory,
+            preferFp16 = preferFp16Graphs,
+        )
+        for (modelName in sessionModelNames) {
             val modelFile = File(modelDirectory, modelName)
             require(modelFile.exists()) { "Model file not found: ${modelFile.absolutePath}" }
-            sessions[modelName] = environment.createSession(modelFile.absolutePath, options)
+            val role = ModelRoleSessionOptions.roleForModelFile(modelName)
+            val loadedModelName = try {
+                sessions[modelName] = createSession(modelFile, modelDirectory, role)
+                modelName
+            } catch (error: Exception) {
+                val fallbackName = characterModel.modelFiles.fallbackSessionModelName(modelName)
+                val fallbackFile = fallbackName?.let { File(modelDirectory, it) }
+                if (fallbackName == null || fallbackFile == null || !fallbackFile.isFile) {
+                    throw error
+                }
+                sessions[fallbackName] = createSession(
+                    fallbackFile,
+                    modelDirectory,
+                    ModelRoleSessionOptions.roleForModelFile(fallbackName),
+                )
+                fallbackName
+            }
+            traceLogger.event(
+                InferenceTraceEvent.Model(
+                    InferenceTraceRecord(
+                        modelRole = ModelRoleSessionOptions.roleForModelFile(loadedModelName),
+                        provider = ModelRoleSessionOptions.providerFor(backend, role),
+                    ),
+                ),
+            )
         }
 
         warmUp()
@@ -67,6 +117,29 @@ class OrtCpuBackend(
     fun warmUp() {
         for ((_, session) in sessions) {
             warmUpSession(environment, session)
+        }
+    }
+
+    private fun createSession(
+        modelFile: File,
+        modelDirectory: File,
+        role: InferenceModelRole,
+    ): OrtSession {
+        val options = OrtSession.SessionOptions()
+        return try {
+            applySessionOptions(options, role)
+            val externalInitializers = if (role == InferenceModelRole.PROMPT_ENCODER) {
+                promptExternalInitializers ?: Fp16ExternalInitializers.loadOrNull(
+                    environment = environment,
+                    modelDirectory = modelDirectory,
+                ).also { promptExternalInitializers = it }
+            } else {
+                null
+            }
+            externalInitializers?.let { options.addExternalInitializers(it.values) }
+            environment.createSession(modelFile.absolutePath, options)
+        } finally {
+            options.close()
         }
     }
 
@@ -112,114 +185,64 @@ class OrtCpuBackend(
 
             val stageSession = session(T2S_STAGE_DECODER)
             val stageInputNames = stageSession.inputNames.toList()
-            val stageOutputNames = stageSession.outputNames.toList()
             val decoderProgress = decoderProgressCallback(maxDecoderSteps)
 
-            val predSemantic = if (NativeDecoderLoop.isAvailable()) {
-                val fsd = requireNotNull(previousDecoderResult)
-                previousDecoderResult = null
+            // The CPU production path intentionally uses the regular ORT array
+            // loop. The native QNN decoder remains under the accelerator archive.
+            val decoderInputs = mutableListOf<OnnxTensorLike>()
+            val feed = mutableMapOf<String, OnnxTensorLike>()
+            val runOptions = OrtSession.RunOptions().apply {
+                setLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_FATAL)
+            }
+            var generatedSteps = 0
+            var presentStartIndex = 2
 
-                val yTensor = fsd.get(0) as OnnxTensor
-                val yData = LongArray(yTensor.info.numElements.toInt())
-                yTensor.longBuffer.get(yData)
-                val yShape = yTensor.info.shape
+            try {
+                timer.measure("decoder_loop_ms") {
+                    while (generatedSteps < maxDecoderSteps) {
+                        val previous = requireNotNull(previousDecoderResult)
+                        decoderInputs.clear()
+                        decoderInputs.add(tensorLike(previous, 0))
+                        decoderInputs.add(tensorLike(previous, 1))
+                        for (index in presentStartIndex until previous.size()) {
+                            decoderInputs.add(tensorLike(previous, index))
+                        }
 
-                val yEmbTensor = fsd.get(1) as OnnxTensor
-                val yEmbData = FloatArray(yEmbTensor.info.numElements.toInt())
-                yEmbTensor.floatBuffer.get(yEmbData)
-                val yEmbShape = yEmbTensor.info.shape
+                        feed.clear()
+                        for (i in stageInputNames.indices) {
+                            feed[stageInputNames[i]] = decoderInputs[i]
+                        }
 
-                val numKv = (fsd.size() - 2) / 2 * 2
-                val kvTensor0 = fsd.get(2) as OnnxTensor
-                val kvShape = kvTensor0.info.shape
-                val kvPerTensor = kvTensor0.info.numElements.toInt()
-                val kvData = FloatArray(kvPerTensor * numKv)
-                for (i in 0 until numKv) {
-                    val t = fsd.get(2 + i) as OnnxTensor
-                    t.floatBuffer.get(kvData, i * kvPerTensor, kvPerTensor)
-                }
-                fsd.close()
+                        val stageResult = stageSession.run(feed, runOptions)
+                        previous.close()
+                        previousDecoderResult = stageResult
+                        generatedSteps += 1
+                        presentStartIndex = 3
+                        decoderProgress(generatedSteps, maxDecoderSteps)
 
-                val outputMapping = IntArray(stageInputNames.size) { i ->
-                    if (i < 2) i else i + 1
-                }
-
-                val semantic = timer.measure("decoder_loop_ms") {
-                    NativeDecoderLoop.runDecoderLoop(
-                        session = stageSession,
-                        inputNames = stageInputNames,
-                        outputNames = stageOutputNames,
-                        initialY = yData, yShape = yShape,
-                        initialYEmb = yEmbData, yEmbShape = yEmbShape,
-                        initialKv = kvData, kvShape = kvShape,
-                        numKvTensors = numKv,
-                        outputMapping = outputMapping,
-                        useQnnIoBinding = backend == ExecutionBackend.QNN,
-                        maxSteps = maxDecoderSteps,
-                        progressCallback = decoderProgress,
-                    )
-                }
-
-                val finalSemantic = if (semantic.isNotEmpty()) {
-                    semantic[semantic.lastIndex] = 0L
-                    semantic
-                } else { longArrayOf(0L) }
-
-                OnnxTensor.createTensor(
-                    environment,
-                    LongBuffer.wrap(finalSemantic),
-                    longArrayOf(1L, 1L, finalSemantic.size.toLong()),
-                ).also(ownedTensors::add)
-            } else {
-                val decoderInputs = mutableListOf<OnnxTensorLike>()
-                val feed = mutableMapOf<String, OnnxTensorLike>()
-                val runOptions = OrtSession.RunOptions().apply {
-                    setLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_FATAL)
-                }
-                var generatedSteps = 0
-                var presentStartIndex = 2
-
-                try {
-                    timer.measure("decoder_loop_ms") {
-                        while (generatedSteps < maxDecoderSteps) {
-                            val previous = requireNotNull(previousDecoderResult)
-                            decoderInputs.clear()
-                            decoderInputs.add(tensorLike(previous, 0))
-                            decoderInputs.add(tensorLike(previous, 1))
-                            for (index in presentStartIndex until previous.size()) {
-                                decoderInputs.add(tensorLike(previous, index))
-                            }
-
-                            feed.clear()
-                            for (i in stageInputNames.indices) {
-                                feed[stageInputNames[i]] = decoderInputs[i]
-                            }
-
-                            val stageResult = stageSession.run(feed, runOptions)
-                            previous.close()
-                            previousDecoderResult = stageResult
-                            generatedSteps += 1
-                            presentStartIndex = 3
-                            decoderProgress.onProgress(generatedSteps, maxDecoderSteps)
-
-                            if (booleanValue(stageResult.get(2))) {
-                                break
-                            }
+                        if (booleanValue(stageResult.get(2))) {
+                            break
                         }
                     }
-                } finally {
-                    runOptions.close()
                 }
-
-                finalDecoderResult = requireNotNull(previousDecoderResult)
-                previousDecoderResult = null
-                semanticTensorFromDecoderOutput(finalDecoderResult, generatedSteps)
-                    .also(ownedTensors::add)
+            } finally {
+                runOptions.close()
             }
+
+            finalDecoderResult = requireNotNull(previousDecoderResult)
+            previousDecoderResult = null
+            val predSemantic = semanticTensorFromDecoderOutput(finalDecoderResult, generatedSteps)
+                .also(ownedTensors::add)
 
             val vocoderInputs = if (hasPromptEncoder()) {
                 timer.event(InferenceTraceEvent.TensorCount(InferenceTensorMetric.SEMANTIC_TOKENS, predSemantic.info.numElements))
                 timer.event(InferenceTraceEvent.TensorShape(InferenceTensorMetric.SEMANTIC_SHAPE, predSemantic.info.shape))
+                timer.event(
+                    InferenceTraceEvent.TensorHash(
+                        InferenceTensorMetric.SEMANTIC_HASH,
+                        InferenceTraceHash.sha256(longTensorValues(predSemantic)),
+                    ),
+                )
                 val ge = createFloatTensor(input.globalEmbedding).also(ownedTensors::add)
                 val geAdvanced = createFloatTensor(input.advancedGlobalEmbedding).also(ownedTensors::add)
                 mapOf(
@@ -231,6 +254,12 @@ class OrtCpuBackend(
             } else {
                 timer.event(InferenceTraceEvent.TensorCount(InferenceTensorMetric.SEMANTIC_TOKENS, predSemantic.info.numElements))
                 timer.event(InferenceTraceEvent.TensorShape(InferenceTensorMetric.SEMANTIC_SHAPE, predSemantic.info.shape))
+                timer.event(
+                    InferenceTraceEvent.TensorHash(
+                        InferenceTensorMetric.SEMANTIC_HASH,
+                        InferenceTraceHash.sha256(longTensorValues(predSemantic)),
+                    ),
+                )
                 val refAudio = createFloatTensor(
                     requireNotNull(input.refAudio32k) { "V2 vocoder requires refAudio32k in TtsPreparedInput." }
                 ).also(ownedTensors::add)
@@ -263,6 +292,14 @@ class OrtCpuBackend(
 
     fun encodePrompt(refAudio32k: FloatArray, speakerEmbedding: FloatTensorData): PromptEmbeddings {
         require(sessions.isNotEmpty()) { "CPU backend is not initialized." }
+        return runPromptEncoder(PROMPT_ENCODER, refAudio32k, speakerEmbedding)
+    }
+
+    private fun runPromptEncoder(
+        modelName: String,
+        refAudio32k: FloatArray,
+        speakerEmbedding: FloatTensorData,
+    ): PromptEmbeddings {
         val refAudio = OnnxTensor.createTensor(
             environment,
             FloatBuffer.wrap(refAudio32k),
@@ -271,7 +308,7 @@ class OrtCpuBackend(
         val svEmbedding = createFloatTensor(speakerEmbedding)
         refAudio.use {
             svEmbedding.use {
-                session(PROMPT_ENCODER).run(
+                session(modelName).run(
                     mapOf(
                         "ref_audio" to refAudio,
                         "sv_emb" to svEmbedding,
@@ -286,9 +323,72 @@ class OrtCpuBackend(
         }
     }
 
+    fun encodePromptBatch(
+        referenceAudio32k: List<FloatArray>,
+        speakerEmbeddings: List<FloatTensorData>,
+    ): PromptEmbeddings {
+        require(referenceAudio32k.isNotEmpty()) { "At least one reference audio is required." }
+        require(referenceAudio32k.size == speakerEmbeddings.size) {
+            "Reference audio and speaker embedding counts must match."
+        }
+        return runPromptBatchGraph(referenceAudio32k, speakerEmbeddings)
+    }
+
+    private fun runPromptBatchGraph(
+        referenceAudio32k: List<FloatArray>,
+        speakerEmbeddings: List<FloatTensorData>,
+    ): PromptEmbeddings {
+        val capability = requireNotNull(multiReferenceCapability()) {
+            "The loaded model does not provide the multi-reference prompt encoder."
+        }
+        // This layer receives tensors rather than paths; validate the count without
+        // inventing duplicate path values that would reject valid ordered slots.
+        capability.validateReferenceCount(referenceAudio32k.size)
+        val maxReferenceCount = capability.maxReferenceCount
+        val placeholderAudioSamples = capability.placeholderAudioSamples
+        val embeddingWidth = speakerEmbeddings.first().values.size
+        require(speakerEmbeddings.all { it.values.size == embeddingWidth }) {
+            "Speaker embedding dimensions must match."
+        }
+        val ownedTensors = mutableListOf<OnnxTensor>()
+        val feed = linkedMapOf<String, OnnxTensorLike>()
+        try {
+            feed[REFERENCE_COUNT_INPUT] = OnnxTensor.createTensor(
+                environment,
+                LongBuffer.wrap(longArrayOf(referenceAudio32k.size.toLong())),
+                longArrayOf(1L),
+            ).also(ownedTensors::add)
+            for (index in 0 until maxReferenceCount) {
+                // Unused slots still execute the unrolled source graph. Give
+                // STFT nodes a valid zero waveform; the graph masks its output
+                // before reduction, so this does not affect conditioning.
+                val audio = referenceAudio32k.getOrNull(index)
+                    ?: FloatArray(placeholderAudioSamples)
+                val embedding = speakerEmbeddings.getOrNull(index)
+                    ?: FloatTensorData(FloatArray(embeddingWidth), longArrayOf(1L, embeddingWidth.toLong()))
+                feed["ref_audio_$index"] = OnnxTensor.createTensor(
+                    environment,
+                    FloatBuffer.wrap(audio),
+                    longArrayOf(1L, audio.size.toLong()),
+                ).also(ownedTensors::add)
+                feed["sv_emb_$index"] = createFloatTensor(embedding).also(ownedTensors::add)
+            }
+            session(MULTI_REFERENCE_PROMPT_ENCODER).run(feed).use { result ->
+                return PromptEmbeddings(
+                    globalEmbedding = floatTensorData(result.get(0) as OnnxTensor),
+                    advancedGlobalEmbedding = floatTensorData(result.get(1) as OnnxTensor),
+                )
+            }
+        } finally {
+            ownedTensors.forEach(OnnxTensor::close)
+        }
+    }
+
     override fun close() {
         sessions.values.forEach(OrtSession::close)
         sessions.clear()
+        promptExternalInitializers?.close()
+        promptExternalInitializers = null
     }
 
     private fun session(modelName: String): OrtSession {
@@ -309,6 +409,12 @@ class OrtCpuBackend(
     private fun tensorLike(result: OrtSession.Result, index: Int): OnnxTensorLike =
         result.get(index) as OnnxTensorLike
 
+    private fun longTensorValues(tensor: OnnxTensor): LongArray {
+        val values = LongArray(tensor.info.numElements.toInt())
+        tensor.longBuffer.get(values)
+        return values
+    }
+
     private fun semanticTensorFromDecoderOutput(
         decoderResult: OrtSession.Result,
         generatedSteps: Int,
@@ -318,26 +424,9 @@ class OrtCpuBackend(
         require(shape.size == 2) { "Expected decoder y shape [batch, tokens], got ${shape.contentToString()}" }
         require(shape[0] == 1L) { "Only batch size 1 is supported for prototype CPU generation." }
 
-        val tokenCount = minOf(generatedSteps.coerceAtLeast(1), shape[1].toInt())
         val source = LongArray(yTensor.info.numElements.toInt())
         yTensor.longBuffer.get(source)
-        val start = source.size - tokenCount
-        var semantic = source.copyOfRange(start, source.size)
-
-        // EOS trimming: remove tokens whose value >= 1024 (EOS/special tokens).
-        // Mirrors Python Inference.py:41-44 — truncate at the first EOS occurrence.
-        val firstEosIndex = semantic.indexOfFirst { it >= 1024L }
-        if (firstEosIndex >= 0) {
-            semantic = if (firstEosIndex > 0) {
-                semantic.copyOfRange(0, firstEosIndex)
-            } else {
-                longArrayOf(0L)
-            }
-        }
-
-        if (semantic.isNotEmpty()) {
-            semantic[semantic.lastIndex] = 0L
-        }
+        val semantic = SemanticTokenSlicing.completedTokens(source, generatedSteps)
 
         return OnnxTensor.createTensor(
             environment,
@@ -349,10 +438,10 @@ class OrtCpuBackend(
     private fun booleanValue(value: OnnxValue): Boolean =
         scalarBoolean(value.value)
 
-    private fun decoderProgressCallback(maxDecoderSteps: Int): NativeDecoderLoop.DecoderProgressCallback {
+    private fun decoderProgressCallback(maxDecoderSteps: Int): (Int, Int) -> Unit {
         var lastPercent = -1
         val safeMaxSteps = maxDecoderSteps.coerceAtLeast(1)
-        return NativeDecoderLoop.DecoderProgressCallback { generatedSteps, _ ->
+        val callback: (Int, Int) -> Unit = { generatedSteps, _ ->
             val decoderPercent = (generatedSteps * 100 / safeMaxSteps).coerceIn(0, 100)
             val overallPercent = (
                 DECODER_PROGRESS_START +
@@ -367,7 +456,9 @@ class OrtCpuBackend(
                     "Decoding $generatedSteps/$safeMaxSteps",
                 )
             }
-        }.also { it.onProgress(0, safeMaxSteps) }
+        }
+        callback(0, safeMaxSteps)
+        return callback
     }
 
     private fun floatTensorData(tensor: OnnxTensor): FloatTensorData {
@@ -392,6 +483,8 @@ class OrtCpuBackend(
         private const val T2S_FIRST_STAGE_DECODER = "t2s_first_stage_decoder_fp32.onnx"
         private const val T2S_STAGE_DECODER = "t2s_stage_decoder_fp32.onnx"
         private const val PROMPT_ENCODER = "prompt_encoder_fp32.onnx"
+        private const val MULTI_REFERENCE_PROMPT_ENCODER = "prompt_encoder_multi_fp32.onnx"
+        private const val REFERENCE_COUNT_INPUT = "reference_count"
         private const val VITS = "vits_fp32.onnx"
         private const val DECODER_PROGRESS_START = 82
         private const val DECODER_PROGRESS_END = 94
@@ -414,33 +507,10 @@ class OrtCpuBackend(
             options.setInterOpNumThreads(threadPlan.interOpThreads)
         }
 
-        // Kept for XNNPACK parity debugging; MainActivity does not expose it as a selectable backend yet.
-        fun configureXnnpackSessionOptions(options: OrtSession.SessionOptions) {
-            val threadPlan = cpuThreadPlan(Runtime.getRuntime().availableProcessors())
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            options.setMemoryPatternOptimization(true)
-            options.setCPUArenaAllocator(true)
-            options.addXnnpack(mapOf(
-                "intra_op_num_threads" to threadPlan.intraOpThreads.toString(),
-            ))
-        }
-
-        fun configureQnnSessionOptions(
-            options: OrtSession.SessionOptions,
-            providerOptions: Map<String, String>,
-        ) {
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            options.setMemoryPatternOptimization(true)
-            options.setCPUArenaAllocator(true)
-            // Add QNN EP last so the shared ORT setup above stays identical to CPU/XNNPACK.
-            options.addQnn(providerOptions)
-        }
-
         fun sessionModelPaths(modelRoot: File, characterModel: CharacterModel): List<File> {
             val modelDirectory = File(modelRoot, characterModel.relativeModelDirectory)
-            return characterModel.modelFiles.sessionModels.map { File(modelDirectory, it) }
+            return characterModel.modelFiles.sessionModelNames(modelDirectory)
+                .map { File(modelDirectory, it) }
         }
 
         fun warmUpSession(environment: OrtEnvironment, session: OrtSession) {
@@ -457,6 +527,12 @@ class OrtCpuBackend(
                     val tensor = when (tensorInfo.type) {
                         OnnxJavaType.FLOAT -> OnnxTensor.createTensor(
                             environment, FloatBuffer.wrap(FloatArray(numElements)), shape,
+                        )
+                        OnnxJavaType.FLOAT16 -> OnnxTensor.createTensor(
+                            environment,
+                            ShortBuffer.wrap(ShortArray(numElements)),
+                            shape,
+                            OnnxJavaType.FLOAT16,
                         )
                         OnnxJavaType.INT64 -> OnnxTensor.createTensor(
                             environment, LongBuffer.wrap(LongArray(numElements)), shape,

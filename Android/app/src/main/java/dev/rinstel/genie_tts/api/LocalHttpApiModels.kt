@@ -20,6 +20,7 @@ data class ActiveDefaults(
     val referenceText: String,
     val maxDecoderSteps: Int,
     val promptLanguage: String = language,
+    val auxiliaryReferenceAudioPaths: List<String> = emptyList(),
 )
 
 sealed class InferResult {
@@ -45,7 +46,10 @@ internal data class InferPayload(
     val referenceAudioPath: String,
     val referenceText: String,
     val maxDecoderSteps: Int,
+    val auxiliaryReferenceAudioPaths: List<String> = emptyList(),
 )
+
+private const val JSON_ARRAY_SEPARATOR = "\u0000"
 
 internal fun BackendServiceState.toJsonString(): String =
     jsonObject(
@@ -86,6 +90,7 @@ internal fun parseInferPayload(body: String): InferPayload {
         referenceAudioPath = values["referenceAudioPath"].orEmpty().trim(),
         referenceText = values["referenceText"].orEmpty().trim(),
         maxDecoderSteps = values["maxDecoderSteps"]?.trim()?.toIntOrNull() ?: 500,
+        auxiliaryReferenceAudioPaths = parseReferencePathList(values["auxReferenceAudioPaths"]),
     )
 }
 
@@ -100,6 +105,13 @@ internal fun jsonObject(vararg entries: Pair<String, Any?>): String =
 
 internal fun jsonArray(items: List<String>): String =
     items.joinToString(prefix = "[", postfix = "]", separator = ",")
+
+private fun parseReferencePathList(value: String?): List<String> =
+    value
+        ?.split(JSON_ARRAY_SEPARATOR)
+        ?.map(String::trim)
+        ?.filter(String::isNotBlank)
+        .orEmpty()
 
 private fun jsonValue(value: Any?): String =
     when (value) {
@@ -203,6 +215,9 @@ private class JsonCursor(
         if (peek() == '"') {
             return readString()
         }
+        if (peek() == '[') {
+            return readStringArray()
+        }
         val start = index
         while (index < source.length) {
             val current = source[index]
@@ -215,6 +230,26 @@ private class JsonCursor(
         return when (token) {
             "", "null" -> null
             else -> token
+        }
+    }
+
+    private fun readStringArray(): String {
+        expect('[')
+        skipWhitespace()
+        if (peek() == ']') {
+            expect(']')
+            return ""
+        }
+        val values = mutableListOf<String>()
+        while (true) {
+            skipWhitespace()
+            values += readString()
+            skipWhitespace()
+            when (readDelimiter()) {
+                ',' -> continue
+                ']' -> return values.joinToString(JSON_ARRAY_SEPARATOR)
+                else -> throw IllegalArgumentException("Malformed JSON array.")
+            }
         }
     }
 

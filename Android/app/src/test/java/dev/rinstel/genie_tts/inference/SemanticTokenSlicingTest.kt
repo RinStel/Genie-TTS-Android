@@ -13,18 +13,18 @@ class SemanticTokenSlicingTest {
     }
 
     @Test
-    fun normalEosExcludesTheTerminalEosToken() {
+    fun maxStepsKeepsEveryGeneratedSemanticToken() {
         assertArrayEquals(
-            longArrayOf(11L, 12L),
-            SemanticTokenSlicing.completedTokens(longArrayOf(99L, 11L, 12L, 1024L), completedCount = 3),
+            longArrayOf(11L, 12L, 13L),
+            SemanticTokenSlicing.completedTokens(longArrayOf(99L, 11L, 12L, 13L), completedCount = 3),
         )
     }
 
     @Test
-    fun maxStepsExcludesTheTerminalDecoderOutput() {
+    fun normalEosExcludesTheSpecialToken() {
         assertArrayEquals(
             longArrayOf(21L, 22L),
-            SemanticTokenSlicing.completedTokens(longArrayOf(99L, 21L, 22L, 23L), completedCount = 3),
+            SemanticTokenSlicing.completedTokens(longArrayOf(99L, 21L, 22L, 1024L), completedCount = 3),
         )
     }
 
@@ -33,6 +33,14 @@ class SemanticTokenSlicingTest {
         assertArrayEquals(
             longArrayOf(31L, 32L),
             SemanticTokenSlicing.completedTokens(longArrayOf(99L, 31L, 32L, 0L), completedCount = 3),
+        )
+    }
+
+    @Test
+    fun specialTokenBeforeBoundaryIsTruncated() {
+        assertArrayEquals(
+            longArrayOf(41L),
+            SemanticTokenSlicing.completedTokens(longArrayOf(99L, 41L, 1024L, 0L), completedCount = 3),
         )
     }
 

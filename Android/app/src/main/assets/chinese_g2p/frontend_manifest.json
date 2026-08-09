@@ -1,0 +1,32 @@
+{
+  "contextual_lexicon": {
+    "entry_count": 348974,
+    "has_word_pinyin": true,
+    "max_word_length": 16,
+    "total_frequency": 60101750
+  },
+  "frontend": "genie_tts_chinese",
+  "resources": {
+    "contextual_lexicon": "contextual_lexicon.tsv",
+    "opencpop": "opencpop-strict.txt",
+    "polyphonic_pinyin": "polyphonic.json",
+    "single_char_pinyin": "single_char_pinyin.json",
+    "traditional_to_simplified": "traditional_to_simplified.tsv"
+  },
+  "schema_version": 1,
+  "source_hashes": {
+    "jieba_fast/dict.txt": "7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8",
+    "opencpop-strict.txt": "d66bbb1380a8ebf17d7ace5bf4b459f3728a469eea2aaeae2aeb3969b88223ff",
+    "polyphonic.json": "a66ea71641d220a583ca5a94dea06a30f7c929808f605f67b1c380ce68449219",
+    "single_char_pinyin.json": "1133b669d9b426c1723409f66902bc80bd2085dd6352a400d034edbc35083f7d",
+    "src/genie_tts/G2P/Chinese/ChineseG2P.py": "883424316be9d61ed9a2bb7434d3cfa74f1ef1eddba489ba74ac185327978756",
+    "src/genie_tts/G2P/Chinese/CorrectPronunciation.py": "3a5adadbb80beab02b4b0541766ad72b8827d3af46403aba1b79beb324f242b5",
+    "src/genie_tts/G2P/Chinese/Erhua.py": "5f81ab6fd9aa1d991411421f28bf3af4c023eec7852ed996f8ca6e81f308f6f5",
+    "src/genie_tts/G2P/Chinese/Normalization/char_convert.py": "8ad7c7e2fa62ad1aa8011f9e5117771f9083effba6dda86a3b249485659b1d49",
+    "src/genie_tts/G2P/Chinese/Normalization/text_normlization.py": "29776b20b166d9c08728f8170e115501d324fc8a2fc832cc2283a0eb00d7c1c7",
+    "src/genie_tts/G2P/Chinese/ToneSandhi.py": "e87bb41c86831522082db6208f6d4a299d263c0fd4ded558b7b6ccbda68ac3ee"
+  },
+  "traditional_mapping": {
+    "entry_count": 10736
+  }
+}

@@ -25,6 +25,7 @@ class GenerationPipeline(
             }
             timer.event(InferenceTraceEvent.TensorCount(InferenceTensorMetric.AUDIO_SAMPLES, result.audio.size.toLong()))
             timer.event(InferenceTraceEvent.TensorShape(InferenceTensorMetric.AUDIO_SHAPE, result.shape))
+            timer.traceFloatTensor(InferenceTensorMetric.AUDIO_HASH, result.audio)
             val outputFile = java.io.File(
                 outputDirectory,
                 "${request.characterModel.id}-${System.currentTimeMillis()}.wav",

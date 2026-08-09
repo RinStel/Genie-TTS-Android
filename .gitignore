@@ -10,7 +10,7 @@ CharacterModels/
 UserData/
 GENIE_ENV/
 Deprecated/
-test/
+/test/
 
 # Python
 __pycache__/
@@ -38,8 +38,27 @@ wheels/
 # Editor directories and files
 .idea/
 .vscode/
+.superpowers/
 *.swp
 *.swo
 
 # MacOS
 .DS_Store
+
+# Android
+Android/.gradle/
+Android/build/
+Android/app/build/
+Android/.kotlin/
+Android/local.properties
+Android/signing/
+Android/**/*.iml
+Android/.externalNativeBuild/
+Android/.cxx/
+Android/captures/
+Android/**/hs_err_pid*.log
+Android/**/replay_pid*.log
+
+# Local native parity checks
+Android/app/src/main/cpp/.host-build/
+tests/parity/.tmp/

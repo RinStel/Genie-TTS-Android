@@ -6,6 +6,7 @@ import dev.rinstel.genie_tts.inference.ExecutionBackend
 import dev.rinstel.genie_tts.inference.GenerationRequest
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -22,6 +23,9 @@ class LocalHttpApiServer(
         fun currentState(): BackendServiceState
         fun availableModels(): List<CharacterModel>
         fun supportedBackends(): Set<ExecutionBackend>
+        fun supportsAuxiliaryReferences(model: CharacterModel): Boolean =
+            model.modelFiles.maxAuxiliaryReferenceCount > 0 &&
+                model.modelFiles.optionalSessionModels.contains("prompt_encoder_multi_fp32.onnx")
         fun activeDefaults(): ActiveDefaults?
         fun infer(backend: ExecutionBackend, request: GenerationRequest): Boolean
         fun inferBlocking(backend: ExecutionBackend, request: GenerationRequest, timeoutMs: Long): InferResult
@@ -37,6 +41,16 @@ class LocalHttpApiServer(
 
     fun start(port: Int) {
         stop()
+        if (port !in MIN_API_PORT..MAX_API_PORT) {
+            updateStatus(
+                ApiServerStatus(
+                    running = false,
+                    port = port,
+                    lastError = "API port must be between $MIN_API_PORT and $MAX_API_PORT.",
+                ),
+            )
+            return
+        }
         try {
             val socket = ServerSocket()
             socket.reuseAddress = true
@@ -162,6 +176,11 @@ class LocalHttpApiServer(
             referenceAudioPath = params["referenceAudioPath"] ?: defaults?.referenceAudioPath ?: "",
             referenceText = params["referenceText"] ?: defaults?.referenceText ?: "",
             maxDecoderSteps = params["maxDecoderSteps"]?.toIntOrNull() ?: defaults?.maxDecoderSteps ?: 500,
+            auxiliaryReferenceAudioPaths = params["auxReferenceAudioPaths"]
+                ?.split('|')
+                ?.map(String::trim)
+                ?.filter(String::isNotBlank)
+                ?: defaults?.auxiliaryReferenceAudioPaths.orEmpty(),
         )
         return inferWithPayload(payload)
     }
@@ -185,6 +204,21 @@ class LocalHttpApiServer(
         ) {
             return HttpResponse(400, errorJson("language, text, referenceAudioPath, and referenceText are required."))
         }
+        validateReferenceAudioPath(payload.referenceAudioPath)?.let { error ->
+            return HttpResponse(400, errorJson(error))
+        }
+        if (payload.maxDecoderSteps <= 0) {
+            return HttpResponse(400, errorJson("maxDecoderSteps must be positive."))
+        }
+        validateAuxiliaryReferencePaths(
+            paths = payload.auxiliaryReferenceAudioPaths,
+            primaryPath = payload.referenceAudioPath,
+        )?.let { error ->
+            return HttpResponse(400, errorJson(error))
+        }
+        validateAuxiliaryReferenceCapability(model, payload.auxiliaryReferenceAudioPaths)?.let { error ->
+            return HttpResponse(400, errorJson(error))
+        }
 
         val result = bridge.inferBlocking(
             backend = backend,
@@ -196,6 +230,7 @@ class LocalHttpApiServer(
                 referenceAudioPath = payload.referenceAudioPath,
                 referenceText = payload.referenceText,
                 maxDecoderSteps = payload.maxDecoderSteps,
+                auxiliaryReferenceAudioPaths = payload.auxiliaryReferenceAudioPaths,
             ),
             timeoutMs = INFER_TIMEOUT_MS,
         )
@@ -215,6 +250,64 @@ class LocalHttpApiServer(
             InferResult.Busy -> HttpResponse(409, errorJson("Inference is already running."))
             InferResult.Timeout -> HttpResponse(504, errorJson("Inference timed out."))
         }
+    }
+
+    private fun validateReferenceAudioPath(path: String): String? {
+        val file = File(path)
+        val canonical = runCatching { file.canonicalFile }.getOrElse { file.absoluteFile }
+        if (!canonical.isFile) {
+            return "Reference audio not found: $path"
+        }
+        return null
+    }
+
+    private fun validateAuxiliaryReferencePaths(
+        paths: List<String>,
+        primaryPath: String? = null,
+    ): String? {
+        val canonicalPrimaryPath = primaryPath?.let { rawPath ->
+            val file = File(rawPath)
+            runCatching { file.canonicalFile }.getOrElse { file.absoluteFile }.absolutePath
+        }
+        val canonicalPaths = paths.map { rawPath ->
+            if (rawPath.isBlank()) {
+                return "Auxiliary reference paths cannot be blank."
+            }
+            val file = File(rawPath)
+            val canonical = runCatching { file.canonicalFile }.getOrElse { file.absoluteFile }
+            if (!canonical.isFile) {
+                return "Auxiliary reference audio not found: $rawPath"
+            }
+            if (canonical.absolutePath == canonicalPrimaryPath) {
+                return "Auxiliary reference path duplicates the primary reference."
+            }
+            canonical.absolutePath
+        }
+        if (canonicalPaths.distinct().size != canonicalPaths.size) {
+            return "Auxiliary reference paths must be unique."
+        }
+        return null
+    }
+
+    private fun validateAuxiliaryReferenceCapability(
+        model: CharacterModel,
+        paths: List<String>,
+    ): String? {
+        if (paths.isEmpty()) return null
+        val modelFiles = model.modelFiles
+        if (
+            modelFiles.maxAuxiliaryReferenceCount <= 0 ||
+            !modelFiles.optionalSessionModels.contains("prompt_encoder_multi_fp32.onnx")
+        ) {
+            return "The selected model does not support auxiliary references."
+        }
+        if (!bridge.supportsAuxiliaryReferences(model)) {
+            return "The selected model does not have the multi-reference prompt encoder installed."
+        }
+        if (paths.size > modelFiles.maxAuxiliaryReferenceCount) {
+            return "At most ${modelFiles.maxAuxiliaryReferenceCount} auxiliary references are supported."
+        }
+        return null
     }
 
     private fun readRequest(socket: Socket): ParsedRequest {
@@ -325,6 +418,8 @@ class LocalHttpApiServer(
 
     companion object {
         private const val LOOPBACK_ADDRESS = "127.0.0.1"
+        private const val MIN_API_PORT = 1024
+        private const val MAX_API_PORT = 65535
         private const val INFER_TIMEOUT_MS = 300_000L
 
         @Volatile
