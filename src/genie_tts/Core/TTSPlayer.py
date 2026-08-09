@@ -6,7 +6,7 @@ import threading
 
 import numpy as np
 import wave
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Sequence
 import logging
 
 from ..Utils.TextSplitter import TextSplitter
@@ -44,6 +44,7 @@ class TTSPlayer:
         self._current_save_path: Optional[str] = None
         self._session_audio_chunks: List[np.ndarray] = []
         self._split: bool = False
+        self._auxiliary_reference_audio_paths: tuple[str, ...] = ()
 
         self._chunk_callback: Optional[Callable[[Optional[bytes]], None]] = None
 
@@ -92,7 +93,9 @@ class TTSPlayer:
                     stage_decoder=gsv_model.T2S_STAGE_DECODER,
                     vocoder=gsv_model.VITS,
                     prompt_encoder=gsv_model.PROMPT_ENCODER,
+                    prompt_encoder_multi=gsv_model.MULTI_REFERENCE_PROMPT_ENCODER,
                     language=gsv_model.LANGUAGE,
+                    aux_reference_audio_paths=self._auxiliary_reference_audio_paths,
                 )
 
                 if audio_chunk is not None:
@@ -166,7 +169,8 @@ class TTSPlayer:
             play: bool = False,
             split: bool = False,
             save_path: Optional[str] = None,
-            chunk_callback: Optional[Callable[[Optional[bytes]], None]] = None
+            chunk_callback: Optional[Callable[[Optional[bytes]], None]] = None,
+            auxiliary_reference_audio_paths: Optional[Sequence[str]] = None,
     ):
         with self._api_lock:
             self._tts_done_event.clear()
@@ -187,6 +191,7 @@ class TTSPlayer:
 
             self._play = play
             self._split = split
+            self._auxiliary_reference_audio_paths = tuple(auxiliary_reference_audio_paths or ())
             self._current_save_path = save_path
             self._session_audio_chunks = []
 

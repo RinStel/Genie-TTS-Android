@@ -1,0 +1,415 @@
+{
+  "cases": [
+    {
+      "category": "contextual_polyphones",
+      "expected": {
+        "normalized_text": "银行行长正在长跑.",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            17
+          ],
+          "values": [
+            318,
+            197,
+            158,
+            113,
+            317,
+            205,
+            125,
+            113,
+            320,
+            148,
+            319,
+            105,
+            125,
+            113,
+            245,
+            119,
+            3
+          ]
+        },
+        "phones": [
+          "y",
+          "in2",
+          "h",
+          "ang2",
+          "x",
+          "ing5",
+          "ch",
+          "ang2",
+          "zh",
+          "eng4",
+          "z",
+          "ai4",
+          "ch",
+          "ang2",
+          "p",
+          "ao3",
+          "."
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            9
+          ],
+          "values": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "contextual-polyphones",
+      "input_text": "银行行长正在长跑。"
+    },
+    {
+      "category": "neutral_tone",
+      "expected": {
+        "normalized_text": "妈妈,我们去吧.",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            14
+          ],
+          "values": [
+            225,
+            97,
+            225,
+            101,
+            1,
+            316,
+            232,
+            225,
+            144,
+            247,
+            299,
+            122,
+            101,
+            3
+          ]
+        },
+        "phones": [
+          "m",
+          "a1",
+          "m",
+          "a5",
+          ",",
+          "w",
+          "o3",
+          "m",
+          "en5",
+          "q",
+          "v4",
+          "b",
+          "a5",
+          "."
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            8
+          ],
+          "values": [
+            2,
+            2,
+            1,
+            2,
+            2,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "neutral-tone",
+      "input_text": "妈妈，我们去吧。"
+    },
+    {
+      "category": "third_tone_chain",
+      "expected": {
+        "normalized_text": "你好很好.",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            9
+          ],
+          "values": [
+            227,
+            167,
+            158,
+            118,
+            158,
+            142,
+            158,
+            119,
+            3
+          ]
+        },
+        "phones": [
+          "n",
+          "i2",
+          "h",
+          "ao2",
+          "h",
+          "en3",
+          "h",
+          "ao3",
+          "."
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            5
+          ],
+          "values": [
+            2,
+            2,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "third-tone-chain",
+      "input_text": "你好很好。"
+    },
+    {
+      "category": "numbers",
+      "expected": {
+        "normalized_text": "今天是二零二六年七月十三日.",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            27
+          ],
+          "values": [
+            221,
+            196,
+            252,
+            176,
+            251,
+            214,
+            33,
+            153,
+            224,
+            202,
+            33,
+            153,
+            224,
+            219,
+            227,
+            177,
+            247,
+            166,
+            318,
+            309,
+            251,
+            212,
+            250,
+            107,
+            248,
+            214,
+            3
+          ]
+        },
+        "phones": [
+          "j",
+          "in1",
+          "t",
+          "ian1",
+          "sh",
+          "ir4",
+          "EE",
+          "er4",
+          "l",
+          "ing2",
+          "EE",
+          "er4",
+          "l",
+          "iu4",
+          "n",
+          "ian2",
+          "q",
+          "i1",
+          "y",
+          "ve4",
+          "sh",
+          "ir2",
+          "s",
+          "an1",
+          "r",
+          "ir4",
+          "."
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            14
+          ],
+          "values": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "numbers",
+      "input_text": "今天是2026年7月13日。"
+    },
+    {
+      "category": "punctuation",
+      "expected": {
+        "normalized_text": "你好,世界!真的?",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            15
+          ],
+          "values": [
+            227,
+            167,
+            158,
+            119,
+            1,
+            251,
+            214,
+            221,
+            194,
+            0,
+            320,
+            140,
+            127,
+            134,
+            4
+          ]
+        },
+        "phones": [
+          "n",
+          "i2",
+          "h",
+          "ao3",
+          ",",
+          "sh",
+          "ir4",
+          "j",
+          "ie4",
+          "!",
+          "zh",
+          "en1",
+          "d",
+          "e5",
+          "?"
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            9
+          ],
+          "values": [
+            2,
+            2,
+            1,
+            2,
+            2,
+            1,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "punctuation",
+      "input_text": "你好，世界！真的？"
+    },
+    {
+      "category": "erhua",
+      "expected": {
+        "normalized_text": "这儿有一朵花儿.",
+        "phone_ids": {
+          "dtype": "int64",
+          "shape": [
+            1,
+            15
+          ],
+          "values": [
+            320,
+            133,
+            33,
+            153,
+            318,
+            242,
+            318,
+            169,
+            127,
+            292,
+            158,
+            260,
+            33,
+            151,
+            3
+          ]
+        },
+        "phones": [
+          "zh",
+          "e4",
+          "EE",
+          "er4",
+          "y",
+          "ou3",
+          "y",
+          "i4",
+          "d",
+          "uo3",
+          "h",
+          "ua1",
+          "EE",
+          "er2",
+          "."
+        ],
+        "word2ph": {
+          "dtype": "int64",
+          "shape": [
+            8
+          ],
+          "values": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1
+          ]
+        }
+      },
+      "id": "erhua",
+      "input_text": "这儿有一朵花儿。"
+    }
+  ],
+  "fixture_type": "chinese_frontend",
+  "schema_version": 1
+}

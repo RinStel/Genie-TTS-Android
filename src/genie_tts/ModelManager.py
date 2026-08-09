@@ -17,6 +17,7 @@ from onnxruntime import InferenceSession
 from tokenizers import Tokenizer
 
 from .Core.Resources import (HUBERT_MODEL_DIR, SV_MODEL, ROBERTA_MODEL_DIR)
+from .Converter.v2ProPlus.MultiReferenceExporter import MultiReferenceSpec, read_multi_reference_spec
 from .Utils.Utils import LRUCacheDict
 
 onnxruntime.set_default_logger_severity(3)
@@ -36,6 +37,7 @@ class GSVModelFile:
     VITS_WEIGHT_FP16: str = 'vits_fp16.bin'
 
     PROMPT_ENCODER: str = 'prompt_encoder_fp32.onnx'
+    PROMPT_ENCODER_MULTI: str = 'prompt_encoder_multi_fp32.onnx'
     PROMPT_ENCODER_WEIGHT_FP16: str = 'prompt_encoder_fp16.bin'
 
     HUBERT_MODEL = os.path.join(HUBERT_MODEL_DIR, "chinese-hubert-base.onnx")
@@ -54,6 +56,10 @@ class GSVModel:
     VITS: InferenceSession
     PROMPT_ENCODER: Optional[InferenceSession] = None
     PROMPT_ENCODER_PATH: Optional[str] = None
+    MULTI_REFERENCE_PROMPT_ENCODER: Optional[InferenceSession] = None
+    MULTI_REFERENCE_PROMPT_ENCODER_PATH: Optional[str] = None
+    MULTI_REFERENCE_SUPPORTED: bool = False
+    MULTI_REFERENCE_MAX_COUNT: int = 0
 
 
 # 去重候选目录，同时保留搜索顺序，避免重复扫描相同路径。
@@ -186,6 +192,7 @@ class ModelManager:
         )
         self.character_to_language: Dict[str, str] = {}
         self.character_model_paths: Dict[str, str] = {}
+        self.character_multi_reference: Dict[str, Optional[MultiReferenceSpec]] = {}
         self.providers = ["CPUExecutionProvider"]
 
         self.cn_hubert: Optional[InferenceSession] = None
@@ -275,6 +282,11 @@ class ModelManager:
             t2s_stage_decoder = model_map.get(GSVModelFile.T2S_STAGE_DECODER_FP32) or \
                                 model_map.get(GSVModelFile.T2S_STAGE_DECODER_FP16)
             prompt_encoder_path = os.path.join(self.character_model_paths[character_name], GSVModelFile.PROMPT_ENCODER)
+            multi_prompt_encoder_path = os.path.join(
+                self.character_model_paths[character_name],
+                GSVModelFile.PROMPT_ENCODER_MULTI,
+            )
+            multi_reference_spec = self.character_multi_reference.get(character_name)
 
             return GSVModel(
                 LANGUAGE=language,
@@ -284,6 +296,14 @@ class ModelManager:
                 VITS=model_map[GSVModelFile.VITS_FP32],
                 PROMPT_ENCODER=model_map[GSVModelFile.PROMPT_ENCODER],
                 PROMPT_ENCODER_PATH=prompt_encoder_path,
+                MULTI_REFERENCE_PROMPT_ENCODER=model_map.get(GSVModelFile.PROMPT_ENCODER_MULTI),
+                MULTI_REFERENCE_PROMPT_ENCODER_PATH=(
+                    multi_prompt_encoder_path if os.path.isfile(multi_prompt_encoder_path) else None
+                ),
+                MULTI_REFERENCE_SUPPORTED=multi_reference_spec is not None,
+                MULTI_REFERENCE_MAX_COUNT=(
+                    multi_reference_spec.max_reference_count if multi_reference_spec is not None else 0
+                ),
             )
         if character_name in self.character_model_paths:
             model_dir = self.character_model_paths[character_name]
@@ -359,6 +379,19 @@ class ModelManager:
                 else:
                     raise FileNotFoundError(f'文件 {model_path} 不存在！')
 
+            multi_prompt_encoder_path = os.path.join(model_dir, GSVModelFile.PROMPT_ENCODER_MULTI)
+            if os.path.isfile(multi_prompt_encoder_path):
+                multi_sess_options = onnxruntime.SessionOptions()
+                multi_sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+                # The multi-reference graph keeps the FP32 external layout,
+                # while the shipped weights remain the original FP16 file.
+                model_dict[GSVModelFile.PROMPT_ENCODER_MULTI] = load_session_with_fp16_conversion(
+                    multi_prompt_encoder_path,
+                    os.path.join(model_dir, GSVModelFile.PROMPT_ENCODER_WEIGHT_FP16),
+                    providers=self.providers,
+                    sess_options=multi_sess_options,
+                )
+
             # 日志信息
             is_v2pp = model_dict[GSVModelFile.PROMPT_ENCODER] is not None
             logger.info(
@@ -370,6 +403,12 @@ class ModelManager:
             self.character_to_model[character_name] = model_dict
             self.character_to_language[character_name] = language
             self.character_model_paths[character_name] = model_dir
+            prompt_encoder_path = os.path.join(model_dir, GSVModelFile.PROMPT_ENCODER_MULTI)
+            self.character_multi_reference[character_name] = (
+                read_multi_reference_spec(prompt_encoder_path)
+                if os.path.isfile(prompt_encoder_path)
+                else None
+            )
             return True
 
         except Exception as e:
@@ -381,12 +420,14 @@ class ModelManager:
 
     def remove_all_character(self) -> None:
         self.character_to_model.clear()
+        self.character_multi_reference.clear()
         gc.collect()
 
     def remove_character(self, character_name: str) -> None:
         character_name = character_name.lower()
         if character_name in self.character_to_model:
             del self.character_to_model[character_name]
+            self.character_multi_reference.pop(character_name, None)
             gc.collect()
             logger.info(f"Character {character_name.capitalize()} removed successfully.")
 

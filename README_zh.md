@@ -110,6 +110,29 @@ GENIE 包含几个预定义的说话人角色，您可以立即使用 —— 例
 **[https://huggingface.co/High-Logic/Genie/tree/main/CharacterModels](
 https://huggingface.co/High-Logic/Genie/tree/main/CharacterModels)**
 
+### 📦 Android 资源包
+
+Android 将公共推理资源与角色模型分开分发。公共资源包由 Gradle 生成：
+
+```powershell
+cd Android
+.\gradlew.bat :app:bundleRuntimeAssets `
+  -PgenieRuntimeAssets="C:\path\to\GenieData"
+```
+
+角色模型包使用仓库内的标准库脚本生成。输入目录应为
+`CharacterModels/<variant>/<characterId>`，并包含 `tts_models`、至少一个
+ONNX 文件、`prompt_wav.json` 和 `prompt_wav/<默认参考音频>`：
+
+```powershell
+python tools/package_android_character_model.py `
+  "C:\path\to\CharacterModels\v2ProPlus\Alice" `
+  --output "C:\path\to\Alice-character.zip"
+```
+
+如果输入目录不在 `CharacterModels/<variant>/<characterId>` 下，可以显式指定
+`--variant` 和 `--character-id`。在 Android 设置页的“资源导入”中分别选择公共资源包或角色模型包即可；同名角色会被安全替换，其它角色不会受到影响。
+
 使用以下示例进行尝试：
 
 ```python
@@ -155,6 +178,8 @@ genie.tts(
     text="<TEXT_TO_SYNTHESIZE>",  # 要合成的文本
     play=True,  # 直接播放音频
     save_path="<OUTPUT_AUDIO_PATH>",  # 输出音频文件路径
+    # 可选：V2ProPlus 多参考音频，不需要填写对应文本
+    aux_reference_audio_paths=[r"<AUX_REFERENCE_AUDIO_1>", r"<AUX_REFERENCE_AUDIO_2>"],
 )
 
 genie.wait_for_playback_done()  # 确保音频播放完成
@@ -182,7 +207,9 @@ import genie_tts as genie
 genie.convert_to_onnx(
     torch_pth_path=r"<YOUR .PTH MODEL FILE>",  # 替换为您的 .pth 文件
     torch_ckpt_path=r"<YOUR .CKPT CHECKPOINT FILE>",  # 替换为您的 .ckpt 文件
-    output_dir=r"<ONNX MODEL OUTPUT DIRECTORY>"  # 保存 ONNX 模型的目录
+    output_dir=r"<ONNX MODEL OUTPUT DIRECTORY>",  # 保存 ONNX 模型的目录
+    export_multi_reference=True,  # 额外导出 V2ProPlus 多参考 Prompt 编码器
+    max_reference_count=8,
 )
 ```
 

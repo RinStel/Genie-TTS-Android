@@ -23,7 +23,7 @@ onnxruntime.set_default_logger_severity(3)
 from pathlib import Path
 import json
 import asyncio
-from typing import AsyncIterator, Optional, Union, Dict
+from typing import AsyncIterator, Optional, Union, Dict, Sequence
 
 from .Audio.ReferenceAudio import ReferenceAudio
 from .Core.Resources import ensure_exists, Chinese_G2P_DIR, English_G2P_DIR
@@ -196,6 +196,7 @@ async def tts_async(
         play: bool = False,
         split_sentence: bool = False,
         save_path: Union[str, PathLike, None] = None,
+        aux_reference_audio_paths: Optional[Sequence[Union[str, PathLike]]] = None,
 ) -> AsyncIterator[bytes]:
     """
     Asynchronously generates speech from text and yields audio chunks.
@@ -248,6 +249,7 @@ async def tts_async(
         split=split_sentence,
         save_path=save_path,
         chunk_callback=tts_chunk_callback,
+        auxiliary_reference_audio_paths=[os.fspath(path) for path in (aux_reference_audio_paths or ())],
     )
 
     # 馈送文本并通知会话结束
@@ -268,6 +270,7 @@ def tts(
         play: bool = False,
         split_sentence: bool = True,
         save_path: Union[str, PathLike, None] = None,
+        aux_reference_audio_paths: Optional[Sequence[Union[str, PathLike]]] = None,
 ) -> None:
     """
     Synchronously generates speech from text.
@@ -303,6 +306,7 @@ def tts(
         play=play,
         split=split_sentence,
         save_path=save_path,
+        auxiliary_reference_audio_paths=[os.fspath(path) for path in (aux_reference_audio_paths or ())],
     )
     tts_player.feed(text)
     tts_player.end_session()
@@ -327,6 +331,8 @@ def convert_to_onnx(
         torch_ckpt_path: Union[str, PathLike],
         torch_pth_path: Union[str, PathLike],
         output_dir: Union[str, PathLike],
+        export_multi_reference: bool = False,
+        max_reference_count: int = 8,
 ) -> None:
     """
     Converts PyTorch model checkpoints to the ONNX format.
@@ -354,6 +360,8 @@ def convert_to_onnx(
         torch_pth_path=torch_pth_path,
         torch_ckpt_path=torch_ckpt_path,
         output_dir=output_dir,
+        export_multi_reference=export_multi_reference,
+        max_reference_count=max_reference_count,
     )
 
 

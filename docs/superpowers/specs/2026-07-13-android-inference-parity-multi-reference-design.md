@@ -67,7 +67,7 @@ The implementation should prefer a small native resampler integrated through the
 
 ## Decoder Parity
 
-The Kotlin and JNI loops use one shared definition of generated-step count and semantic slicing. Tests cover normal EOS, EOS on the first generated token, maximum-step termination, and native/array paths. The result passed to the vocoder must match the Python baseline fixture, including the terminal token behavior.
+The Kotlin and JNI loops use one shared definition of generated-step count and semantic slicing. Each decoder step appends one token, so the helper takes the last `completed_count` tokens, retains a normal token even when the stop flag is set, and truncates at the first special/EOS token. Tests cover normal EOS, EOS on the first generated token, maximum-step termination, and native/array paths. The result passed to the vocoder must match the corrected Python baseline fixture, including explicit terminal-token replacement behavior.
 
 If investigation proves Python's `-idx:` expression itself is off by one, the repository must first add a Python regression test and correct Python and Android together. Android must not preserve a known Python defect merely to make an accidental implementation detail equal.
 
@@ -81,14 +81,21 @@ T2S and vocoder sessions retain QNN acceleration where supported. Provider optio
 
 GPT-SoVITS V2ProPlus treats auxiliary references as independent reference spectrograms and speaker embeddings; they do not require prompt text and they are not averaged in Android application code.
 
-The converter gains a versioned multi-reference export path built from the matching GPT-SoVITS V2ProPlus PyTorch model implementation. The exported graph accepts:
+The converter gains a versioned multi-reference export path built from the matching GPT-SoVITS V2ProPlus PyTorch model implementation. The primary reference remains the source of prompt text, HuBERT content, and T2S semantic conditioning. When auxiliary references are requested, the exported graph accepts:
 
-- one primary reference audio;
-- zero or more auxiliary reference audios represented by padded tensors plus lengths, or another ONNX-safe representation proven equivalent to the upstream list behavior;
+- one or more auxiliary reference audios represented by independent dynamic-length inputs plus a count, or another ONNX-safe representation proven equivalent to the upstream list behavior;
 - one speaker embedding per reference;
-- the existing text and semantic inputs.
+- the existing text and semantic inputs through the surrounding V2ProPlus pipeline.
+
+With no auxiliary references, Android continues to use the legacy single-reference prompt graph. This matches GPT-SoVITS' auxiliary-reference behavior: auxiliary audio has no transcript of its own and supplies independent acoustic conditioning rather than replacing the primary semantic prompt.
 
 The wrapper reproduces upstream list ordering and conditioning operations before export. Export validation compares PyTorch and ONNX outputs for one, two, and three references. Model metadata records the interface version and maximum supported reference count if the graph requires a fixed bound.
+
+The implemented `multi_reference_v1` graph uses a bounded set of independent
+dynamic-length input pairs (`ref_audio_N`, `sv_emb_N`) plus a `reference_count`
+input. Unused slots are masked inside ONNX before the conditioning tensors are
+reduced, so Android never pads variable-length waveforms or averages embedding
+outputs in application code.
 
 The existing single-reference `prompt_encoder_fp32.onnx` and `vits_fp32.onnx` remain supported. Android detects model inputs/metadata at initialization:
 

@@ -161,6 +161,8 @@ genie.tts(
     text="<TEXT_TO_SYNTHESIZE>",  # Text to synthesize
     play=True,  # Play audio directly
     save_path="<OUTPUT_AUDIO_PATH>",  # Output audio file path
+    # Optional V2ProPlus auxiliary references; no matching text is required.
+    aux_reference_audio_paths=[r"<AUX_REFERENCE_AUDIO_1>", r"<AUX_REFERENCE_AUDIO_2>"],
 )
 
 genie.wait_for_playback_done()  # Ensure audio playback completes
@@ -188,7 +190,9 @@ import genie_tts as genie
 genie.convert_to_onnx(
     torch_pth_path=r"<YOUR .PTH MODEL FILE>",  # Replace with your .pth file
     torch_ckpt_path=r"<YOUR .CKPT CHECKPOINT FILE>",  # Replace with your .ckpt file
-    output_dir=r"<ONNX MODEL OUTPUT DIRECTORY>"  # Directory to save ONNX model
+    output_dir=r"<ONNX MODEL OUTPUT DIRECTORY>",  # Directory to save ONNX model
+    export_multi_reference=True,  # Also export the V2ProPlus multi-reference prompt encoder
+    max_reference_count=8,
 )
 ```
 

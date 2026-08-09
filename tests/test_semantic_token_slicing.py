@@ -48,12 +48,12 @@ slice_semantic_tokens = _load_slice_semantic_tokens()
             np.array([[]], dtype=np.int64),
         ),
         (
-            np.array([[99, 11, 12, 1024]], dtype=np.int64),
+            np.array([[99, 11, 12, 13]], dtype=np.int64),
             3,
-            np.array([[11, 12]], dtype=np.int64),
+            np.array([[11, 12, 13]], dtype=np.int64),
         ),
         (
-            np.array([[99, 21, 22, 23]], dtype=np.int64),
+            np.array([[99, 21, 22, 1024]], dtype=np.int64),
             3,
             np.array([[21, 22]], dtype=np.int64),
         ),
@@ -62,10 +62,21 @@ slice_semantic_tokens = _load_slice_semantic_tokens()
             3,
             np.array([[31, 32]], dtype=np.int64),
         ),
+        (
+            np.array([[99, 41, 1024, 0]], dtype=np.int64),
+            3,
+            np.array([[41]], dtype=np.int64),
+        ),
     ],
-    ids=["one_step_eos", "normal_eos", "max_steps", "terminal_replacement"],
+    ids=[
+        "one_step_eos",
+        "max_steps",
+        "normal_eos",
+        "terminal_replacement",
+        "special_token_before_boundary",
+    ],
 )
-def test_slice_semantic_tokens_excludes_terminal_decoder_output(
+def test_slice_semantic_tokens_keeps_generated_suffix_and_truncates_specials(
     decoder_output: np.ndarray,
     completed_count: int,
     expected: np.ndarray,

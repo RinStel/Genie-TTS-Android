@@ -2,6 +2,7 @@ import torch
 import onnx
 import json
 import os
+import numpy as np
 from collections import OrderedDict
 
 from ..load_state_dict import load_sovits_model
@@ -120,9 +121,16 @@ class PromptEncoderConverter:
         # 保存修改后的、链接到 fp32 权重的 ONNX 模型
         onnx.save(model, self.relinked_fp32_onnx_path)
 
-    def run_full_process(self):
+    def step3_reconstruct_fp32_bin(self):
+        """Materialize the external FP32 file required by direct ONNX sessions."""
+        fp16_values = np.fromfile(self.fp16_bin_path, dtype=np.float16)
+        fp16_values.astype(np.float32, copy=False).tofile(self.reconstructed_fp32_bin_path)
+
+    def run_full_process(self, reconstruct_fp32_bin: bool = False):
         """
         按顺序执行核心的转换步骤 (1 和 2)。
         """
         self.step1_create_fp16_bin_and_fp32_index()
         self.step2_relink_onnx_for_fp32()
+        if reconstruct_fp32_bin:
+            self.step3_reconstruct_fp32_bin()

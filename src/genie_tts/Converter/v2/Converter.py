@@ -141,6 +141,7 @@ def convert(torch_ckpt_path: str,
             logger.error(f"❌ A critical error occurred during the conversion process")
             logger.error(traceback.format_exc())
             remove_folder(output_dir)  # 只在失败时清理输出目录
+            raise
         finally:
             # 无论成功还是失败，都尝试清理缓存目录
             remove_folder(CACHE_DIR)
