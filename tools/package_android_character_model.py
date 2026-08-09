@@ -8,7 +8,10 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from zipfile import ZIP_STORED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
+
+
+ZIP_COMPRESSION_LEVEL = 9
 
 
 @dataclass(frozen=True)
@@ -88,12 +91,18 @@ def package_character_model(
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-        with ZipFile(temporary_path, mode="w", compression=ZIP_STORED, allowZip64=True) as archive:
+        with ZipFile(
+            temporary_path,
+            mode="w",
+            compression=ZIP_DEFLATED,
+            compresslevel=ZIP_COMPRESSION_LEVEL,
+            allowZip64=True,
+        ) as archive:
             for path, archive_name in archive_files:
-                archive.write(path, archive_name, compress_type=ZIP_STORED)
+                archive.write(path, archive_name, compress_type=ZIP_DEFLATED)
             if generated_prompt_json is not None:
-                archive.writestr(generated_prompt_name, generated_prompt_json, compress_type=ZIP_STORED)
-            archive.writestr(manifest_name, manifest_bytes, compress_type=ZIP_STORED)
+                archive.writestr(generated_prompt_name, generated_prompt_json, compress_type=ZIP_DEFLATED)
+            archive.writestr(manifest_name, manifest_bytes, compress_type=ZIP_DEFLATED)
         os.replace(temporary_path, output)
         temporary_path = None
     finally:

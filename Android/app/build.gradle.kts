@@ -1,10 +1,21 @@
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.tasks.testing.Test
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Exec
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.Sync
-import org.gradle.api.tasks.bundling.Zip
-import org.gradle.api.tasks.bundling.ZipEntryCompression
+import org.gradle.api.tasks.TaskAction
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.zip.Deflater
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 plugins {
     id("com.android.application") version "9.2.1"
@@ -20,6 +31,51 @@ val runtimeAssetOutput = layout.buildDirectory.dir("generated/runtimeAssets")
 val runtimeAssetManifestOutput = layout.buildDirectory.file(
     "generated/runtimeAssetManifest/chinese-hubert-base_weights_fp16_manifest.json",
 )
+
+abstract class HighCompressionRuntimeAssetsTask : DefaultTask() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val sourceDirectory: DirectoryProperty
+
+    @get:OutputFile
+    abstract val archiveFile: RegularFileProperty
+
+    @TaskAction
+    fun createArchive() {
+        val sourceRoot = sourceDirectory.get().asFile
+        val outputFile = archiveFile.get().asFile
+        outputFile.parentFile.mkdirs()
+        val temporaryFile = File(
+            outputFile.parentFile,
+            ".${outputFile.name}.${System.nanoTime()}.tmp",
+        )
+        try {
+            temporaryFile.outputStream().buffered().use { output ->
+                ZipOutputStream(output).use { archive ->
+                    // Use the same high-compression policy as character packages.
+                    archive.setLevel(Deflater.BEST_COMPRESSION)
+                    sourceRoot.walkTopDown()
+                        .filter(File::isFile)
+                        .sortedBy { it.relativeTo(sourceRoot).invariantSeparatorsPath }
+                        .forEach { file ->
+                            val entryName = file.relativeTo(sourceRoot).invariantSeparatorsPath
+                            archive.putNextEntry(ZipEntry(entryName))
+                            file.inputStream().use { it.copyTo(archive) }
+                            archive.closeEntry()
+                        }
+                }
+            }
+            Files.move(
+                temporaryFile.toPath(),
+                outputFile.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } finally {
+            temporaryFile.delete()
+        }
+    }
+}
+
 val generateRuntimeAssetManifest = tasks.register<Exec>("generateRuntimeAssetManifest") {
     val sourceRoot = file(runtimeAssetSource.get())
     inputs.file(File(sourceRoot, "chinese-hubert-base/chinese-hubert-base.onnx"))
@@ -74,14 +130,12 @@ val syncRuntimeAssets = tasks.register<Sync>("syncRuntimeAssets") {
     into(runtimeAssetOutput)
 }
 
-tasks.register<Zip>("bundleRuntimeAssets") {
+tasks.register<HighCompressionRuntimeAssetsTask>("bundleRuntimeAssets") {
     dependsOn(syncRuntimeAssets)
-    from(runtimeAssetOutput)
-    archiveFileName.set("genie-tts-runtime-assets.zip")
-    destinationDirectory.set(layout.buildDirectory.dir("outputs/runtime-assets"))
-    // ONNX and weight files are already effectively incompressible. Stored
-    // entries avoid a second full-device-sized compression pass.
-    entryCompression = ZipEntryCompression.STORED
+    sourceDirectory.set(runtimeAssetOutput)
+    archiveFile.set(
+        layout.buildDirectory.file("outputs/runtime-assets/genie-tts-runtime-assets.zip"),
+    )
 }
 
 android {
@@ -95,7 +149,7 @@ android {
         minSdk = 30
         targetSdk = 36
         versionCode = 1
-        versionName = "1.0"
+        versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

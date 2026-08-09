@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from zipfile import ZIP_STORED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
@@ -35,7 +35,7 @@ def test_packages_character_directory_with_android_root(tmp_path: Path) -> None:
     with ZipFile(output) as archive:
         assert archive.getinfo(
             "CharacterModels/v2ProPlus/Alice/tts_models/t2s_first_stage_decoder_fp32.onnx",
-        ).compress_type == ZIP_STORED
+        ).compress_type == ZIP_DEFLATED
         assert "CharacterModels/v2ProPlus/Alice/prompt_wav/normal.wav" in archive.namelist()
         manifest = json.loads(
             archive.read("CharacterModels/v2ProPlus/Alice/character_manifest.json"),
