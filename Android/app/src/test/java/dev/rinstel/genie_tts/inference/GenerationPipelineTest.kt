@@ -100,6 +100,60 @@ class GenerationPipelineTest {
         )
     }
 
+    @Test
+    fun reportsInferenceAndOutputBoundaries() {
+        val progressEvents = mutableListOf<Pair<GenerationStage, Int?>>()
+        val callbacks = object : BackendRuntimeCallbacks {
+            override fun onStage(
+                stage: GenerationStage,
+                message: String,
+                progressPercent: Int?,
+                progressLabel: String?,
+            ) {
+                progressEvents += stage to progressPercent
+            }
+        }
+        val request = GenerationRequest(
+            characterModel = CharacterModelCatalog.v2ProPlusFromCharacterIds(listOf("mansui")).first(),
+            language = "zh",
+            synthesisText = "test",
+            referenceAudioPath = "/tmp/ref.wav",
+            referenceText = "reference",
+        )
+
+        GenerationPipeline(
+            backend = object : PreparedTtsBackend {
+                override fun isInitialized(): Boolean = true
+
+                override fun generatePrepared(input: TtsPreparedInput, maxDecoderSteps: Int): TtsGenerationResult =
+                    TtsGenerationResult(floatArrayOf(0f), longArrayOf(1L, 1L, 1L))
+            },
+            inputPreparer = object : TtsInputPreparer {
+                override fun prepare(request: GenerationRequest): TtsPreparedInput =
+                    TtsPreparedInput(
+                        refSeq = LongTensorData(longArrayOf(1L), longArrayOf(1L, 1L)),
+                        textSeq = LongTensorData(longArrayOf(2L), longArrayOf(1L, 1L)),
+                        refBert = FloatTensorData(FloatArray(1), longArrayOf(1L, 1L)),
+                        textBert = FloatTensorData(FloatArray(1), longArrayOf(1L, 1L)),
+                        sslContent = FloatTensorData(floatArrayOf(0f), longArrayOf(1L, 1L, 1L)),
+                        globalEmbedding = FloatTensorData(floatArrayOf(0f), longArrayOf(1L, 1L)),
+                        advancedGlobalEmbedding = FloatTensorData(floatArrayOf(0f), longArrayOf(1L, 1L)),
+                    )
+            },
+            outputDirectory = createTempDir(),
+            progressCallbacks = callbacks,
+        ).generate(request)
+
+        assertEquals(
+            listOf(
+                GenerationStage.RUNNING_INFERENCE to GenerationProgress.T2S_ENCODER,
+                GenerationStage.WRITING_OUTPUT to GenerationProgress.WRITING_OUTPUT,
+                GenerationStage.WRITING_OUTPUT to GenerationProgress.OUTPUT_READY,
+            ),
+            progressEvents,
+        )
+    }
+
     private fun initializedBackend(): PreparedTtsBackend =
         object : PreparedTtsBackend {
             override fun isInitialized(): Boolean = true

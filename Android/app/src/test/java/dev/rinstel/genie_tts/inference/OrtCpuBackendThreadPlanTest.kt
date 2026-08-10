@@ -19,4 +19,12 @@ class OrtCpuBackendThreadPlanTest {
             OrtCpuBackend.cpuThreadPlan(0),
         )
     }
+
+    @Test
+    fun usesFewerIntraOpThreadsForAutoregressiveT2s() {
+        assertEquals(
+            OrtCpuBackend.CpuThreadPlan(intraOpThreads = 4, interOpThreads = 1),
+            OrtCpuBackend.cpuThreadPlan(12, InferenceModelRole.T2S),
+        )
+    }
 }

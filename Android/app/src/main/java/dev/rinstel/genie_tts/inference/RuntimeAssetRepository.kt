@@ -2,6 +2,8 @@ package dev.rinstel.genie_tts.inference
 
 import android.content.Context
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 class RuntimeAssetRepository {
     private val filesRoot: File
@@ -36,9 +38,31 @@ class RuntimeAssetRepository {
         )
     }
 
+    @Synchronized
     fun prepareRuntimeWeights() {
-        // FP16 HuBERT weights are expanded to FP32 initializers in memory when
-        // the session is created. Do not create a second disk copy here.
+        val source = hubertFp16WeightsFile()
+        val target = hubertFp32WeightsFile()
+        require(source.isFile) { "Missing FP16 HuBERT weights: ${source.absolutePath}" }
+
+        // ORT can load the model's regular FP32 external data directly from
+        // disk. Materialize it with bounded memory instead of retaining large
+        // Kotlin FloatArrays and OnnxTensors on the 256 MiB app heap.
+        if (target.isFile && target.length() == source.length() * 2L) return
+
+        val temporary = File(target.parentFile, ".${target.name}.${System.nanoTime()}.tmp")
+        try {
+            HalfPrecisionFileConverter.convertFp16FileToFp32File(source, temporary)
+            require(temporary.length() == source.length() * 2L) {
+                "Invalid converted HuBERT weight length."
+            }
+            Files.move(
+                temporary.toPath(),
+                target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } finally {
+            temporary.delete()
+        }
     }
 
     fun hubertModelFile(): File =
@@ -46,6 +70,12 @@ class RuntimeAssetRepository {
 
     fun speakerEncoderFile(): File =
         File(runtimeRoot(), "speaker_encoder.onnx")
+
+    private fun hubertFp16WeightsFile(): File =
+        File(File(runtimeRoot(), "chinese-hubert-base"), "chinese-hubert-base_weights_fp16.bin")
+
+    private fun hubertFp32WeightsFile(): File =
+        File(File(runtimeRoot(), "chinese-hubert-base"), "chinese-hubert-base_weights.bin")
 
     companion object {
         const val RUNTIME_ASSET_DIRECTORY = "RuntimeAssets"

@@ -7,6 +7,7 @@ class GenerationPipeline(
     private val traceLogger: InferenceTraceLogger = InferenceTraceLogger.None,
     private val executionBackend: ExecutionBackend? = null,
     private val runtimeLabel: String? = null,
+    private val progressCallbacks: BackendRuntimeCallbacks? = null,
 ) {
     fun generate(request: GenerationRequest): GeneratedAudioFile {
         val timer = InferenceTimer(traceLogger)
@@ -20,6 +21,12 @@ class GenerationPipeline(
             val preparedInput = timer.measure("prepare_total_ms") {
                 inputPreparer.prepare(request)
             }
+            progressCallbacks?.onStage(
+                GenerationStage.RUNNING_INFERENCE,
+                "running_inference",
+                GenerationProgress.T2S_ENCODER,
+                "T2S encoder",
+            )
             val result = timer.measure("backend_total_ms") {
                 backend.generatePrepared(preparedInput, request.maxDecoderSteps)
             }
@@ -30,9 +37,21 @@ class GenerationPipeline(
                 outputDirectory,
                 "${request.characterModel.id}-${System.currentTimeMillis()}.wav",
             )
+            progressCallbacks?.onStage(
+                GenerationStage.WRITING_OUTPUT,
+                "writing_output",
+                GenerationProgress.WRITING_OUTPUT,
+                "Writing output",
+            )
             timer.measure("write_wav_ms") {
                 WavFileWriter.writeMonoPcm16(outputFile, result.audio, OUTPUT_SAMPLE_RATE)
             }
+            progressCallbacks?.onStage(
+                GenerationStage.WRITING_OUTPUT,
+                "writing_output",
+                GenerationProgress.OUTPUT_READY,
+                "Output ready",
+            )
             GeneratedAudioFile(
                 file = outputFile,
                 audioSamples = result.audio.size,

@@ -29,25 +29,47 @@ class OrtCpuBackend(
         OrtEnvironment.getEnvironment()
     }
     private val sessions: MutableMap<String, OrtSession> = linkedMapOf()
+    private val sessionFiles: MutableMap<String, File> = linkedMapOf()
+    private var modelFiles: RequiredModelFiles? = null
+    private var multiReferenceCapabilityResolved = false
+    private var cachedMultiReferenceCapability: MultiReferenceCapability? = null
 
-    // Reuse one in-memory FP16 -> FP32 initializer set for the legacy and
-    // multi-reference prompt sessions.
-    private var promptExternalInitializers: Fp16ExternalInitializers.Loaded? = null
+    @Volatile
+    private var retainT2SSessionsAfterGeneration = false
 
     @Volatile
     internal var runtimeCallbacks: BackendRuntimeCallbacks? = null
 
-    override fun isInitialized(): Boolean = sessions.isNotEmpty()
+    internal fun reportProgress(
+        stage: GenerationStage,
+        message: String,
+        progressPercent: Int?,
+        progressLabel: String?,
+    ) {
+        runtimeCallbacks?.onStage(stage, message, progressPercent, progressLabel)
+    }
+
+    // Initialization only validates and indexes model files. Heavy ORT
+    // sessions are opened on demand so runtime feature models do not overlap
+    // with the T2S/vocoder working set.
+    override fun isInitialized(): Boolean = sessionFiles.isNotEmpty()
 
     fun hasPromptEncoder(): Boolean =
-        sessions.keys.any { it.contains("prompt_encoder", ignoreCase = true) }
+        sessionFiles.keys.any { it.contains("prompt_encoder", ignoreCase = true) }
 
     fun multiReferenceCapability(): MultiReferenceCapability? {
-        if (!hasPromptEncoder()) return null
-        val multiReferenceSession = sessions[MULTI_REFERENCE_PROMPT_ENCODER] ?: return MultiReferenceCapability(
-            supported = false,
-        )
-        return MultiReferenceCapability.fromSession(multiReferenceSession)
+        if (multiReferenceCapabilityResolved) return cachedMultiReferenceCapability
+        val resolved = when {
+            !hasPromptEncoder() -> null
+            !sessionFiles.keys.any { matchesSessionName(it, MULTI_REFERENCE_PROMPT_ENCODER) } ->
+                MultiReferenceCapability(supported = false)
+            else -> runCatching {
+                MultiReferenceCapability.fromSession(session(MULTI_REFERENCE_PROMPT_ENCODER))
+            }.getOrDefault(MultiReferenceCapability(supported = false))
+        }
+        multiReferenceCapabilityResolved = true
+        cachedMultiReferenceCapability = resolved
+        return resolved
     }
 
     data class CpuThreadPlan(
@@ -77,40 +99,17 @@ class OrtCpuBackend(
         for (modelName in sessionModelNames) {
             val modelFile = File(modelDirectory, modelName)
             require(modelFile.exists()) { "Model file not found: ${modelFile.absolutePath}" }
-            val role = ModelRoleSessionOptions.roleForModelFile(modelName)
-            val loadedModelName = try {
-                sessions[modelName] = createSession(modelFile, modelDirectory, role)
-                modelName
-            } catch (error: Exception) {
-                val fallbackName = characterModel.modelFiles.fallbackSessionModelName(modelName)
-                val fallbackFile = fallbackName?.let { File(modelDirectory, it) }
-                if (fallbackName == null || fallbackFile == null || !fallbackFile.isFile) {
-                    throw error
-                }
-                sessions[fallbackName] = createSession(
-                    fallbackFile,
-                    modelDirectory,
-                    ModelRoleSessionOptions.roleForModelFile(fallbackName),
-                )
-                fallbackName
-            }
-            traceLogger.event(
-                InferenceTraceEvent.Model(
-                    InferenceTraceRecord(
-                        modelRole = ModelRoleSessionOptions.roleForModelFile(loadedModelName),
-                        provider = ModelRoleSessionOptions.providerFor(backend, role),
-                    ),
-                ),
-            )
+            sessionFiles[modelName] = modelFile
         }
+        modelFiles = characterModel.modelFiles
 
-        warmUp()
-
+        // Do not create any sessions here. RoBERTa, HuBERT, speaker encoder,
+        // and the character graphs are loaded in disjoint inference phases.
         return SessionSummary(
             backend = backend,
-            sessionNames = sessions.keys.toList(),
-            inputNames = sessions.values.flatMap { it.inputNames.toList() }.distinct(),
-            outputNames = sessions.values.flatMap { it.outputNames.toList() }.distinct(),
+            sessionNames = sessionFiles.keys.toList(),
+            inputNames = emptyList(),
+            outputNames = emptyList(),
         )
     }
 
@@ -122,21 +121,14 @@ class OrtCpuBackend(
 
     private fun createSession(
         modelFile: File,
-        modelDirectory: File,
         role: InferenceModelRole,
     ): OrtSession {
         val options = OrtSession.SessionOptions()
         return try {
             applySessionOptions(options, role)
-            val externalInitializers = if (role == InferenceModelRole.PROMPT_ENCODER) {
-                promptExternalInitializers ?: Fp16ExternalInitializers.loadOrNull(
-                    environment = environment,
-                    modelDirectory = modelDirectory,
-                ).also { promptExternalInitializers = it }
-            } else {
-                null
-            }
-            externalInitializers?.let { options.addExternalInitializers(it.values) }
+            // Prompt weights are already materialized as the model's normal
+            // FP32 external-data file during model import. Let ORT read that
+            // file directly so the app heap never holds a second Tensor set.
             environment.createSession(modelFile.absolutePath, options)
         } finally {
             options.close()
@@ -144,13 +136,14 @@ class OrtCpuBackend(
     }
 
     override fun generatePrepared(input: TtsPreparedInput, maxDecoderSteps: Int): TtsGenerationResult {
-        require(sessions.isNotEmpty()) { "CPU backend is not initialized." }
+        require(isInitialized()) { "CPU backend is not initialized." }
 
         val timer = InferenceTimer(traceLogger)
         val ownedTensors = mutableListOf<OnnxTensor>()
         var encoderResult: OrtSession.Result? = null
         var previousDecoderResult: OrtSession.Result? = null
         var finalDecoderResult: OrtSession.Result? = null
+        var generationSucceeded = false
 
         try {
             val refSeq = createLongTensor(input.refSeq).also(ownedTensors::add)
@@ -172,6 +165,12 @@ class OrtCpuBackend(
             }
 
             val currentEncoderResult = requireNotNull(encoderResult)
+            reportProgress(
+                GenerationStage.RUNNING_INFERENCE,
+                "running_inference",
+                GenerationProgress.FIRST_DECODER,
+                "First decoder",
+            )
             previousDecoderResult = timer.measure("t2s_first_decoder_ms") {
                 session(T2S_FIRST_STAGE_DECODER).run(
                     mapOf(
@@ -233,6 +232,24 @@ class OrtCpuBackend(
             previousDecoderResult = null
             val predSemantic = semanticTensorFromDecoderOutput(finalDecoderResult, generatedSteps)
                 .also(ownedTensors::add)
+            finalDecoderResult.close()
+            finalDecoderResult = null
+
+            reportProgress(
+                GenerationStage.RUNNING_INFERENCE,
+                "running_inference",
+                GenerationProgress.DECODER_END,
+                "Decoder complete",
+            )
+
+            // Decoder results are copied into predSemantic above. Release the
+            // encoder before VITS; a memory-approved hot path keeps only the
+            // two stateless decoder graphs for the next sentence.
+            if (!retainT2SSessionsAfterGeneration) {
+                closeSessions { roleForSession(it) == InferenceModelRole.T2S }
+            } else {
+                releaseLoadedSessionsKeepingReusableT2S()
+            }
 
             val vocoderInputs = if (hasPromptEncoder()) {
                 timer.event(InferenceTraceEvent.TensorCount(InferenceTensorMetric.SEMANTIC_TOKENS, predSemantic.info.numElements))
@@ -270,29 +287,78 @@ class OrtCpuBackend(
                 )
             }
 
+            // ORT exposes no callback inside one VITS graph execution. Use an
+            // indeterminate bar here instead of claiming a false percentage.
+            reportProgress(
+                GenerationStage.RUNNING_INFERENCE,
+                "running_inference",
+                null,
+                "Vocoder",
+            )
             val vocoderResult = timer.measure("vocoder_ms") {
                 session(VITS).run(vocoderInputs)
             }
-            vocoderResult.use {
+            val generationResult = vocoderResult.use {
                 val audioTensor = vocoderResult.get(0) as OnnxTensor
                 val audio = FloatArray(audioTensor.info.numElements.toInt())
                 audioTensor.floatBuffer.get(audio)
-                return TtsGenerationResult(
+                TtsGenerationResult(
                     audio = audio,
                     shape = audioTensor.info.shape,
                 )
             }
+            reportProgress(
+                GenerationStage.RUNNING_INFERENCE,
+                "running_inference",
+                GenerationProgress.VOCODER_COMPLETE,
+                "Vocoder complete",
+            )
+            return generationResult.also { generationSucceeded = true }
         } finally {
             encoderResult?.close()
             previousDecoderResult?.close()
             finalDecoderResult?.close()
             ownedTensors.forEach(OnnxTensor::close)
+            // The audio has already been copied out of ORT. VITS and the T2S
+            // encoder are always released; only the optional decoder hot cache
+            // survives a successful request.
+            if (retainT2SSessionsAfterGeneration && generationSucceeded) {
+                releaseLoadedSessionsKeepingReusableT2S()
+            } else {
+                releaseLoadedSessions()
+            }
         }
     }
 
     fun encodePrompt(refAudio32k: FloatArray, speakerEmbedding: FloatTensorData): PromptEmbeddings {
-        require(sessions.isNotEmpty()) { "CPU backend is not initialized." }
+        require(isInitialized()) { "CPU backend is not initialized." }
         return runPromptEncoder(PROMPT_ENCODER, refAudio32k, speakerEmbedding)
+    }
+
+    /** Release sessions used only while constructing reference conditioning. */
+    fun releasePreparationSessions() {
+        closeSessions { roleForSession(it) == InferenceModelRole.PROMPT_ENCODER }
+    }
+
+    /** Release all currently loaded graphs before the next feature phase. */
+    fun releaseLoadedSessions() {
+        closeSessions { true }
+    }
+
+    /** Release all T2S graphs when memory pressure makes the hot cache unsafe. */
+    fun releaseT2SSessions() {
+        closeSessions { roleForSession(it) == InferenceModelRole.T2S }
+    }
+
+    /** Keep only the decoder graphs that can be reused by the next sentence. */
+    fun releaseLoadedSessionsKeepingReusableT2S() {
+        closeSessions {
+            roleForSession(it) != InferenceModelRole.T2S || !isReusableT2SSession(it)
+        }
+    }
+
+    fun setRetainT2SSessionsAfterGeneration(retain: Boolean) {
+        retainT2SSessionsAfterGeneration = retain
     }
 
     private fun runPromptEncoder(
@@ -387,17 +453,76 @@ class OrtCpuBackend(
     override fun close() {
         sessions.values.forEach(OrtSession::close)
         sessions.clear()
-        promptExternalInitializers?.close()
-        promptExternalInitializers = null
+        sessionFiles.clear()
+        modelFiles = null
+        multiReferenceCapabilityResolved = false
+        cachedMultiReferenceCapability = null
+        retainT2SSessionsAfterGeneration = false
     }
 
     private fun session(modelName: String): OrtSession {
-        if (sessions.containsKey(modelName)) {
-            return sessions.getValue(modelName)
+        val loadedEntry = sessions.entries.firstOrNull {
+            matchesSessionName(it.key, modelName)
         }
-        val keyword = modelName.substringBefore("_fp32.onnx")
-        val match = sessions.entries.firstOrNull { it.key.contains(keyword, ignoreCase = true) }
-        return requireNotNull(match?.value) { "Session is not loaded: $modelName" }
+        if (loadedEntry != null) return loadedEntry.value
+
+        val selectedName = sessionFiles.keys.firstOrNull {
+            matchesSessionName(it, modelName)
+        }
+        requireNotNull(selectedName) { "Session is not available: $modelName" }
+        val selectedFile = requireNotNull(sessionFiles[selectedName])
+        val selectedRole = roleForSession(selectedName)
+        val loaded = try {
+            selectedName to createSession(selectedFile, selectedRole)
+        } catch (error: Exception) {
+            val fallbackName = modelFiles?.fallbackSessionModelName(selectedName)
+            val fallbackFile = fallbackName?.let { File(selectedFile.parentFile, it) }
+            if (fallbackName == null || fallbackFile == null || !fallbackFile.isFile) {
+                throw error
+            }
+            val fallbackSession = createSession(fallbackFile, roleForSession(fallbackName))
+            sessionFiles.remove(selectedName)
+            sessionFiles[fallbackName] = fallbackFile
+            fallbackName to fallbackSession
+        }
+        val loadedModelName = loaded.first
+        val loadedSession = loaded.second
+        sessions[loadedModelName] = loadedSession
+        traceLogger.event(
+            InferenceTraceEvent.Model(
+                InferenceTraceRecord(
+                    modelRole = roleForSession(loadedModelName),
+                    provider = ModelRoleSessionOptions.providerFor(
+                        backend,
+                        roleForSession(loadedModelName),
+                    ),
+                ),
+            ),
+        )
+        warmUpSession(environment, loadedSession)
+        return loadedSession
+    }
+
+    private fun closeSessions(predicate: (String) -> Boolean) {
+        sessions.keys.filter(predicate).forEach { name ->
+            sessions.remove(name)?.close()
+        }
+    }
+
+    private fun roleForSession(modelName: String): InferenceModelRole =
+        ModelRoleSessionOptions.roleForModelFile(modelName)
+
+    private fun isReusableT2SSession(modelName: String): Boolean =
+        roleForSession(modelName) == InferenceModelRole.T2S &&
+            (matchesSessionName(modelName, T2S_FIRST_STAGE_DECODER) ||
+                matchesSessionName(modelName, T2S_STAGE_DECODER))
+
+    private fun matchesSessionName(actualName: String, requestedName: String): Boolean {
+        if (actualName.equals(requestedName, ignoreCase = true)) return true
+        val keyword = requestedName
+            .substringBefore("_fp32.onnx")
+            .substringBefore("_fp16.onnx")
+        return actualName.contains(keyword, ignoreCase = true)
     }
 
     private fun createLongTensor(data: LongTensorData): OnnxTensor =
@@ -442,18 +567,14 @@ class OrtCpuBackend(
         var lastPercent = -1
         val safeMaxSteps = maxDecoderSteps.coerceAtLeast(1)
         val callback: (Int, Int) -> Unit = { generatedSteps, _ ->
-            val decoderPercent = (generatedSteps * 100 / safeMaxSteps).coerceIn(0, 100)
-            val overallPercent = (
-                DECODER_PROGRESS_START +
-                    (DECODER_PROGRESS_END - DECODER_PROGRESS_START) * decoderPercent / 100
-                ).coerceIn(DECODER_PROGRESS_START, DECODER_PROGRESS_END)
+            val overallPercent = GenerationProgress.decoderPercent(generatedSteps, safeMaxSteps)
             if (overallPercent != lastPercent) {
                 lastPercent = overallPercent
-                runtimeCallbacks?.onStage(
+                reportProgress(
                     GenerationStage.RUNNING_INFERENCE,
                     "running_inference",
                     overallPercent,
-                    "Decoding $generatedSteps/$safeMaxSteps",
+                    "Decoder $generatedSteps/$safeMaxSteps",
                 )
             }
         }
@@ -486,9 +607,6 @@ class OrtCpuBackend(
         private const val MULTI_REFERENCE_PROMPT_ENCODER = "prompt_encoder_multi_fp32.onnx"
         private const val REFERENCE_COUNT_INPUT = "reference_count"
         private const val VITS = "vits_fp32.onnx"
-        private const val DECODER_PROGRESS_START = 82
-        private const val DECODER_PROGRESS_END = 94
-
         fun cpuThreadPlan(availableProcessors: Int): CpuThreadPlan {
             val processors = availableProcessors.coerceAtLeast(1)
             return CpuThreadPlan(
@@ -497,8 +615,38 @@ class OrtCpuBackend(
             )
         }
 
+        fun cpuThreadPlan(
+            availableProcessors: Int,
+            role: InferenceModelRole,
+        ): CpuThreadPlan {
+            val processors = availableProcessors.coerceAtLeast(1)
+            // T2S executes one autoregressive token at a time; a smaller
+            // intra-op pool avoids repeatedly scheduling eight workers.
+            val maxIntraOpThreads = if (role == InferenceModelRole.T2S) 4 else 8
+            return CpuThreadPlan(
+                intraOpThreads = processors.coerceAtMost(maxIntraOpThreads),
+                interOpThreads = 1,
+            )
+        }
+
         fun configureCpuSessionOptions(options: OrtSession.SessionOptions) {
-            val threadPlan = cpuThreadPlan(Runtime.getRuntime().availableProcessors())
+            configureCpuSessionOptions(options, cpuThreadPlan(Runtime.getRuntime().availableProcessors()))
+        }
+
+        fun configureCpuSessionOptionsForRole(
+            options: OrtSession.SessionOptions,
+            role: InferenceModelRole,
+        ) {
+            configureCpuSessionOptions(
+                options,
+                cpuThreadPlan(Runtime.getRuntime().availableProcessors(), role),
+            )
+        }
+
+        private fun configureCpuSessionOptions(
+            options: OrtSession.SessionOptions,
+            threadPlan: CpuThreadPlan,
+        ) {
             options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
             options.setMemoryPatternOptimization(true)
@@ -507,12 +655,7 @@ class OrtCpuBackend(
             options.setInterOpNumThreads(threadPlan.interOpThreads)
         }
 
-        fun sessionModelPaths(modelRoot: File, characterModel: CharacterModel): List<File> {
-            val modelDirectory = File(modelRoot, characterModel.relativeModelDirectory)
-            return characterModel.modelFiles.sessionModelNames(modelDirectory)
-                .map { File(modelDirectory, it) }
-        }
-
+        /** Prime ORT's CPU kernels; exported graphs may reject shape-1 dummies. */
         fun warmUpSession(environment: OrtEnvironment, session: OrtSession) {
             try {
                 val inputInfo = session.inputInfo
@@ -544,12 +687,26 @@ class OrtCpuBackend(
                 }
 
                 if (feed.isNotEmpty()) {
-                    session.run(feed).use { }
+                    val runOptions = OrtSession.RunOptions().apply {
+                        setLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_FATAL)
+                    }
+                    try {
+                        session.run(feed, runOptions).use { }
+                    } finally {
+                        runOptions.close()
+                    }
                 }
                 dummyTensors.forEach(OnnxTensor::close)
-            } catch (e: Exception) {
-                // Warm-up failure is non-fatal; first real inference will trigger compilation.
+            } catch (_: Exception) {
+                // The real request owns the authoritative input shapes.
             }
         }
+
+        fun sessionModelPaths(modelRoot: File, characterModel: CharacterModel): List<File> {
+            val modelDirectory = File(modelRoot, characterModel.relativeModelDirectory)
+            return characterModel.modelFiles.sessionModelNames(modelDirectory)
+                .map { File(modelDirectory, it) }
+        }
+
     }
 }

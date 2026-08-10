@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
@@ -104,6 +105,7 @@ class GenieBackendService : Service() {
             runtimeRepository = runtimeRepository,
             backendEngine = OrtCpuBackend(
                 configureSessionOptions = OrtCpuBackend::configureCpuSessionOptions,
+                configureRoleSessionOptions = OrtCpuBackend::configureCpuSessionOptionsForRole,
                 traceLogger = traceLogger,
             ),
             featureExtractorFactory = { backend ->
@@ -163,6 +165,23 @@ class GenieBackendService : Service() {
         runtimes.values.forEach(BackendRuntime::close)
         runtimes.clear()
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        // Hiding the UI is normal for this foreground service and should not
+        // evict the warm RoBERTa session. Trim only for actual memory pressure.
+        if (level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        ) {
+            runCatching {
+                worker.execute {
+                    runtimes.values.forEach(BackendRuntime::trimMemory)
+                }
+            }
+        }
+        super.onTrimMemory(level)
     }
 
     inner class LocalBinder : Binder() {

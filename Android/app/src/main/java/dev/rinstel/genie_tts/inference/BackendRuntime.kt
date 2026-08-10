@@ -9,4 +9,6 @@ interface BackendRuntime : AutoCloseable {
         request: GenerationRequest,
         callbacks: BackendRuntimeCallbacks,
     ): GeneratedAudioFile
+
+    fun trimMemory() = Unit
 }

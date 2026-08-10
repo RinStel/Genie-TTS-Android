@@ -6,6 +6,7 @@ class OrtSessionRuntime(
     private val backendEngine: OrtCpuBackend = OrtCpuBackend(
         backend = ExecutionBackend.CPU,
         configureSessionOptions = OrtCpuBackend::configureCpuSessionOptions,
+        configureRoleSessionOptions = OrtCpuBackend::configureCpuSessionOptionsForRole,
     ),
     private val traceLogger: InferenceTraceLogger = InferenceTraceLogger.None,
     private val featureExtractorFactory: (OrtCpuBackend) -> OrtRuntimeFeatureExtractor,
@@ -29,6 +30,8 @@ class OrtSessionRuntime(
         callbacks.onStage(
             GenerationStage.INSPECTING_RESOURCES,
             "inspecting",
+            GenerationProgress.RESOURCE_INSPECTION,
+            "Inspecting resources",
         )
         val modelInspection = modelRepository.inspect(request.characterModel.modelFiles)
         require(modelInspection.isComplete) {
@@ -44,12 +47,16 @@ class OrtSessionRuntime(
             callbacks.onStage(
                 GenerationStage.INSTALLING_MODEL,
                 "installing_model",
+                GenerationProgress.MODEL_INSTALL,
+                "Preparing model",
             )
             modelRepository.installToPrivateStorage(request.characterModel.modelFiles)
 
             callbacks.onStage(
                 GenerationStage.INITIALIZING_BACKEND,
                 "initializing_backend",
+                GenerationProgress.BACKEND_INITIALIZATION,
+                "Initializing backend",
             )
             backendEngine.initialize(modelRepository.modelRootDirectory(), request.characterModel)
             initializedModelId = request.characterModel.id
@@ -59,6 +66,8 @@ class OrtSessionRuntime(
             callbacks.onStage(
                 GenerationStage.PREPARING_FEATURES,
                 "preparing_runtime",
+                GenerationProgress.FEATURE_PREPARATION_START,
+                "Preparing runtime",
             )
             runtimeRepository.prepareRuntimeWeights()
             runtimePrepared = true
@@ -66,6 +75,8 @@ class OrtSessionRuntime(
             callbacks.onStage(
                 GenerationStage.PREPARING_FEATURES,
                 "preparing_features",
+                GenerationProgress.FEATURE_PREPARATION_START,
+                "Preparing features",
             )
         }
 
@@ -73,10 +84,6 @@ class OrtSessionRuntime(
             runtimeFeatureExtractor = it
         }
 
-        callbacks.onStage(
-            GenerationStage.RUNNING_INFERENCE,
-            "running_inference",
-        )
         val result = try {
             backendEngine.runtimeCallbacks = callbacks
             GenerationPipeline(
@@ -86,15 +93,12 @@ class OrtSessionRuntime(
                 traceLogger = traceLogger,
                 executionBackend = backendEngine.backend,
                 runtimeLabel = runtimeLabel,
+                progressCallbacks = callbacks,
             ).generate(request)
         } finally {
             backendEngine.runtimeCallbacks = null
         }
 
-        callbacks.onStage(
-            GenerationStage.WRITING_OUTPUT,
-            "writing_output",
-        )
         return result
     }
 
@@ -104,5 +108,11 @@ class OrtSessionRuntime(
         backendEngine.close()
         initializedModelId = null
         runtimePrepared = false
+    }
+
+    override fun trimMemory() {
+        runtimeFeatureExtractor?.releaseLoadedSessions()
+        backendEngine.setRetainT2SSessionsAfterGeneration(false)
+        backendEngine.releaseLoadedSessions()
     }
 }
