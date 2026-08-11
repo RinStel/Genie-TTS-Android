@@ -62,6 +62,11 @@
     <string name="prototype_settings_title">设置</string>
     <string name="prototype_settings_theme_section">界面主题</string>
     <string name="prototype_settings_theme_label">主题模式</string>
+    <string name="prototype_settings_inference_section">推理性能</string>
+    <string name="prototype_settings_t2s_threads_label">T2S CPU 线程</string>
+    <string name="prototype_settings_vocoder_threads_label">Vocoder CPU 线程</string>
+    <string name="prototype_settings_cpu_threads_auto">自动（设备可用线程数）</string>
+    <string name="prototype_settings_cpu_threads_fixed">%1$d 个线程</string>
     <string name="prototype_settings_api_section">本机 API</string>
     <string name="prototype_settings_api_enabled_label">启用 localhost API</string>
     <string name="prototype_settings_api_port_label">监听端口</string>
@@ -90,6 +95,15 @@
     <string name="prototype_settings_import_runtime_success">公共资源包已导入：%1$d 个文件，%2$s。</string>
     <string name="prototype_settings_import_character_success">角色模型已导入：%1$s（%2$d 个文件，%3$s）。</string>
     <string name="prototype_settings_import_failed">导入失败：%1$s</string>
+    <string name="prototype_settings_cache_section">缓存与存储</string>
+    <string name="prototype_settings_cache_description">清理推理缓存、可重新生成的运行时权重和已生成的音频，不会删除角色模型或公共资源包。</string>
+    <string name="prototype_settings_cache_clear_button">清理缓存与生成音频</string>
+    <string name="prototype_settings_cache_confirm_title">清理缓存？</string>
+    <string name="prototype_settings_cache_confirm_message">将清理推理缓存、派生运行时权重和已生成音频，角色模型与公共资源包会保留。</string>
+    <string name="prototype_settings_cache_clear_requested">已请求清理；正在推理时会在本次任务结束后执行。</string>
+    <string name="prototype_settings_cache_clear_failed">清理失败：%1$s</string>
+    <string name="prototype_cache_cleared">缓存已清理：删除 %1$d 个生成音频文件和 %2$d 个运行时缓存文件。</string>
+    <string name="prototype_cache_clear_failed">缓存清理失败：%1$s</string>
     <string name="prototype_stage_inspecting_resources">正在检查资源。</string>
     <string name="prototype_stage_installing_model">正在准备模型。</string>
     <string name="prototype_stage_initializing_backend">正在初始化 %1$s。</string>
@@ -97,6 +111,6 @@
     <string name="prototype_stage_preparing_features">正在提取特征。</string>
     <string name="prototype_stage_running_inference">正在推理。</string>
     <string name="prototype_stage_writing_output">正在写入结果。</string>
-    <string name="prototype_service_completed">生成完成，共输出 %1$d 个采样点。</string>
+    <string name="prototype_service_completed">生成完成，音频长度 %1$s。</string>
     <string name="prototype_service_api_invalid_request">API 请求参数不完整或角色不存在。</string>
 </resources>

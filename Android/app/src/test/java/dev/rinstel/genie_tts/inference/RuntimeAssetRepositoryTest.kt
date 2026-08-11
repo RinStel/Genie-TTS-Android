@@ -2,6 +2,7 @@ package dev.rinstel.genie_tts.inference
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
@@ -36,5 +37,27 @@ class RuntimeAssetRepositoryTest {
         assertEquals(8L, output.length())
         val values = ByteBuffer.wrap(output.readBytes()).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         assertArrayEquals(floatArrayOf(1.0f, -2.0f), FloatArray(2) { values.get() }, 0.0f)
+    }
+
+    @Test
+    fun clearsGeneratedAudioAndDerivedWeightsButKeepsSourceAssets() {
+        val root = createTempDir()
+        val hubertDirectory = File(root, "RuntimeAssets/chinese-hubert-base").apply { mkdirs() }
+        val fp16Weights = File(hubertDirectory, "chinese-hubert-base_weights_fp16.bin")
+            .apply { writeBytes(byteArrayOf(1, 2)) }
+        val fp32Weights = File(hubertDirectory, "chinese-hubert-base_weights.bin")
+            .apply { writeBytes(byteArrayOf(3, 4, 5, 6)) }
+        val outputDirectory = File(root, "GeneratedAudio").apply { mkdirs() }
+        val generatedAudio = File(outputDirectory, "mansui-1.wav").apply { writeBytes(byteArrayOf(1)) }
+        val unrelatedFile = File(outputDirectory, "keep.txt").apply { writeBytes(byteArrayOf(2)) }
+
+        val result = RuntimeAssetRepository(root).clearCaches()
+
+        assertEquals(1, result.generatedAudioFiles)
+        assertEquals(1, result.derivedRuntimeFiles)
+        assertTrue(fp16Weights.isFile)
+        assertFalse(fp32Weights.exists())
+        assertFalse(generatedAudio.exists())
+        assertTrue(unrelatedFile.isFile)
     }
 }

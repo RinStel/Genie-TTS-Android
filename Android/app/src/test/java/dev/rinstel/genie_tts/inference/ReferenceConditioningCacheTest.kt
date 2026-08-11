@@ -2,10 +2,40 @@ package dev.rinstel.genie_tts.inference
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Test
 
 class ReferenceConditioningCacheTest {
+    @Test
+    fun defaultCachesKeepOnlyTheActiveAudiobookContext() {
+        val referenceCache = ReferenceConditioningCache()
+        val firstReference = key(referenceAudioPath = "/ref/one.wav")
+        val secondReference = key(referenceAudioPath = "/ref/two.wav")
+
+        referenceCache.getOrPut(firstReference) { conditioning(1) }
+        referenceCache.getOrPut(secondReference) { conditioning(2) }
+
+        assertNull(referenceCache.get(firstReference))
+        assertNotNull(referenceCache.get(secondReference))
+
+        val promptCache = PromptConditioningCache()
+        val firstPrompt = promptKey(
+            primary = ReferenceAudioFingerprint("/ref/one.wav", 1L, 1L),
+            auxiliary = emptyList(),
+        )
+        val secondPrompt = promptKey(
+            primary = ReferenceAudioFingerprint("/ref/two.wav", 2L, 2L),
+            auxiliary = emptyList(),
+        )
+        promptCache.getOrPut(firstPrompt) { promptEmbeddings(1f) }
+        promptCache.getOrPut(secondPrompt) { promptEmbeddings(2f) }
+
+        assertNull(promptCache.get(firstPrompt))
+        assertNotNull(promptCache.get(secondPrompt))
+    }
+
     @Test
     fun promptCacheKeepsIndependentAuxiliaryBundles() {
         val cache = PromptConditioningCache(maxEntries = 2)
@@ -164,6 +194,12 @@ class ReferenceConditioningCacheTest {
             globalEmbedding = FloatTensorData(floatArrayOf(value.toFloat()), longArrayOf(1L, 1L)),
             advancedGlobalEmbedding = FloatTensorData(floatArrayOf(value.toFloat()), longArrayOf(1L, 1L)),
             refAudio32k = null,
+        )
+
+    private fun promptEmbeddings(value: Float): PromptEmbeddings =
+        PromptEmbeddings(
+            globalEmbedding = FloatTensorData(floatArrayOf(value), longArrayOf(1L)),
+            advancedGlobalEmbedding = FloatTensorData(floatArrayOf(value), longArrayOf(1L)),
         )
 
     private fun promptKey(

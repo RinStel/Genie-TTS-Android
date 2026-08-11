@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
 #include <vector>
 #include <cstring>
 #include "onnxruntime_c_api.h"
@@ -10,10 +11,27 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 static const OrtApi* g_ort = nullptr;
+static void* g_ortLibrary = nullptr;
+
+using OrtGetApiBaseFn = const OrtApiBase* (*)();
 
 static const OrtApi* getOrtApi() {
     if (g_ort) return g_ort;
-    const OrtApiBase* base = OrtGetApiBase();
+    // The QNN AAR ships ORT as a runtime library, not a linkable import
+    // library. Resolve the C API after Java has loaded that same .so.
+    g_ortLibrary = dlopen("libonnxruntime.so", RTLD_NOW | RTLD_LOCAL);
+    if (!g_ortLibrary) {
+        LOGE("dlopen(libonnxruntime.so) failed: %s", dlerror());
+        return nullptr;
+    }
+    auto getApiBase = reinterpret_cast<OrtGetApiBaseFn>(
+        dlsym(g_ortLibrary, "OrtGetApiBase")
+    );
+    if (!getApiBase) {
+        LOGE("dlsym(OrtGetApiBase) failed: %s", dlerror());
+        return nullptr;
+    }
+    const OrtApiBase* base = getApiBase();
     if (!base) { LOGE("OrtGetApiBase() returned null"); return nullptr; }
     g_ort = base->GetApi(ORT_API_VERSION);
     if (!g_ort) { LOGE("GetApi(%d) returned null", ORT_API_VERSION); return nullptr; }

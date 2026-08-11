@@ -108,6 +108,7 @@ class MainActivity : AppCompatActivity() {
             backendService = binder.getService()
             serviceBound = true
             backendService?.addListener(backendListener)
+            refreshBackendOptions(backendService?.supportedBackends().orEmpty())
             syncPathViews()
             pushActiveDefaults()
         }
@@ -126,7 +127,10 @@ class MainActivity : AppCompatActivity() {
         modelRepository = ModelAssetRepository(this)
         runtimeRepository = RuntimeAssetRepository(this)
         referenceAudioPicker = ReferenceAudioPicker(this)
-        backendOptions = BackendCatalog.cpuOnly()
+        backendOptions = BackendCatalog.build(
+            qnnAvailable = BuildConfig.QNN_ENABLED,
+            qnnStatus = "Full",
+        )
         modelOptions = modelRepository.discoverCharacterModels()
 
         bindViews()
@@ -217,9 +221,10 @@ class MainActivity : AppCompatActivity() {
             ArrayAdapter(this, android.R.layout.simple_list_item_1, backendOptions.map(BackendOption::label)),
         )
         backendSelector.setText(BackendCatalog.defaultOption(backendOptions).label, false)
-        // CPU is the only supported production backend; keep the field as a
-        // clear status value rather than exposing a misleading selector.
-        backendSelector.isEnabled = false
+        backendSelector.isEnabled = backendOptions.any { it.backend != ExecutionBackend.CPU && it.enabled }
+        backendSelector.setOnItemClickListener { _, _, _, _ ->
+            pushActiveDefaults()
+        }
 
         modelSelector.setAdapter(
             ArrayAdapter(this, android.R.layout.simple_list_item_1, modelOptions.map(CharacterModel::displayName)),
@@ -565,6 +570,23 @@ class MainActivity : AppCompatActivity() {
             ?: BackendCatalog.defaultOption(backendOptions)
     }
 
+    private fun refreshBackendOptions(supportedBackends: Set<ExecutionBackend>) {
+        val selectedBackend = backendOptions
+            .firstOrNull { it.label == backendSelector.text?.toString() }
+            ?.backend
+        backendOptions = BackendCatalog.build(
+            qnnAvailable = ExecutionBackend.QNN in supportedBackends,
+            qnnStatus = "Full",
+        )
+        backendSelector.setAdapter(
+            ArrayAdapter(this, android.R.layout.simple_list_item_1, backendOptions.map(BackendOption::label)),
+        )
+        val selected = backendOptions.firstOrNull { it.backend == selectedBackend && it.enabled }
+            ?: BackendCatalog.defaultOption(backendOptions)
+        backendSelector.setText(selected.label, false)
+        backendSelector.isEnabled = backendOptions.any { it.backend != ExecutionBackend.CPU && it.enabled }
+    }
+
     private fun selectedModelOrNull(): CharacterModel? {
         val selectedName = modelSelector.text?.toString().orEmpty()
         return modelOptions.firstOrNull { it.displayName == selectedName } ?: modelOptions.firstOrNull()
@@ -604,7 +626,8 @@ class MainActivity : AppCompatActivity() {
         renderProgress(lastServiceState)
         syncPathViews(outputPath = state.latestOutputFilePath)
         runButton.isEnabled = !state.busy
-        backendSelector.isEnabled = false
+        backendSelector.isEnabled = !state.busy &&
+            backendOptions.any { it.backend != ExecutionBackend.CPU && it.enabled }
         modelSelector.isEnabled = !state.busy
         chooseReferenceButton.isEnabled = !state.busy
         chooseAuxiliaryButton.isEnabled = !state.busy && supportsAuxiliaryReferences()

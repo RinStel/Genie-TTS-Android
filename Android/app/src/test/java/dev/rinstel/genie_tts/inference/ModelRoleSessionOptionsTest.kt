@@ -37,7 +37,7 @@ class ModelRoleSessionOptionsTest {
     }
 
     @Test
-    fun everyModelRoleUsesCpuProvider() {
+    fun synthesisRolesUseQnnWhenQnnIsRequested() {
         assertEquals(
             InferenceModelRole.T2S,
             ModelRoleSessionOptions.roleForModelFile("t2s_stage_decoder_fp32.onnx"),
@@ -47,11 +47,11 @@ class ModelRoleSessionOptionsTest {
             ModelRoleSessionOptions.roleForModelFile("vits_fp32.onnx"),
         )
         assertEquals(
-            InferenceProvider.CPU,
+            InferenceProvider.QNN,
             ModelRoleSessionOptions.providerFor(ExecutionBackend.QNN, InferenceModelRole.T2S),
         )
         assertEquals(
-            InferenceProvider.CPU,
+            InferenceProvider.QNN,
             ModelRoleSessionOptions.providerFor(ExecutionBackend.QNN, InferenceModelRole.VOCODER),
         )
         assertEquals(

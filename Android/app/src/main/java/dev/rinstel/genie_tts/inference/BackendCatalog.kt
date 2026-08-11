@@ -9,16 +9,24 @@ object BackendCatalog {
         ),
     )
 
-    /**
-     * Compatibility entry point for older callers. Accelerator probing is no
-     * longer part of the production app, so every catalog is CPU-only.
-     */
+    /** Build the options supported by the selected APK flavor. */
     fun build(
         qnnAvailable: Boolean = false,
         qnnStatus: String = "Archived",
         xnnpackAvailable: Boolean = false,
         xnnpackStatus: String = "Archived",
-    ): List<BackendOption> = cpuOnly()
+    ): List<BackendOption> = buildList {
+        addAll(cpuOnly())
+        if (qnnAvailable) {
+            add(
+                BackendOption(
+                    backend = ExecutionBackend.QNN,
+                    enabled = true,
+                    status = qnnStatus,
+                ),
+            )
+        }
+    }
 
     fun defaultOption(options: List<BackendOption>): BackendOption =
         options.firstOrNull { it.backend == ExecutionBackend.CPU && it.enabled }

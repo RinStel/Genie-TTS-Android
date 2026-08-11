@@ -27,18 +27,23 @@ class OrtSessionRuntime(
         request: GenerationRequest,
         callbacks: BackendRuntimeCallbacks,
     ): GeneratedAudioFile {
+        val timer = InferenceTimer(traceLogger)
         callbacks.onStage(
             GenerationStage.INSPECTING_RESOURCES,
             "inspecting",
             GenerationProgress.RESOURCE_INSPECTION,
             "Inspecting resources",
         )
-        val modelInspection = modelRepository.inspect(request.characterModel.modelFiles)
+        val modelInspection = timer.measure("model_inspection_ms") {
+            modelRepository.inspect(request.characterModel.modelFiles)
+        }
         require(modelInspection.isComplete) {
             "Missing model files: ${modelInspection.missingFiles.joinToString(", ")}"
         }
 
-        val runtimeInspection = runtimeRepository.inspect()
+        val runtimeInspection = timer.measure("runtime_inspection_ms") {
+            runtimeRepository.inspect()
+        }
         require(runtimeInspection.isComplete) {
             "Missing runtime files: ${runtimeInspection.missingFiles.joinToString(", ")}"
         }
@@ -50,7 +55,9 @@ class OrtSessionRuntime(
                 GenerationProgress.MODEL_INSTALL,
                 "Preparing model",
             )
-            modelRepository.installToPrivateStorage(request.characterModel.modelFiles)
+            timer.measure("model_install_ms") {
+                modelRepository.installToPrivateStorage(request.characterModel.modelFiles)
+            }
 
             callbacks.onStage(
                 GenerationStage.INITIALIZING_BACKEND,
@@ -58,7 +65,9 @@ class OrtSessionRuntime(
                 GenerationProgress.BACKEND_INITIALIZATION,
                 "Initializing backend",
             )
-            backendEngine.initialize(modelRepository.modelRootDirectory(), request.characterModel)
+            timer.measure("backend_initialization_ms") {
+                backendEngine.initialize(modelRepository.modelRootDirectory(), request.characterModel)
+            }
             initializedModelId = request.characterModel.id
         }
 
@@ -69,7 +78,9 @@ class OrtSessionRuntime(
                 GenerationProgress.FEATURE_PREPARATION_START,
                 "Preparing runtime",
             )
-            runtimeRepository.prepareRuntimeWeights()
+            timer.measure("runtime_weights_ms") {
+                runtimeRepository.prepareRuntimeWeights()
+            }
             runtimePrepared = true
         } else {
             callbacks.onStage(
@@ -100,6 +111,54 @@ class OrtSessionRuntime(
         }
 
         return result
+    }
+
+    override fun warmup(request: GenerationRequest) {
+        val timer = InferenceTimer(traceLogger)
+        val characterModel = request.characterModel
+        val modelInspection = timer.measure("model_inspection_ms") {
+            modelRepository.inspect(characterModel.modelFiles)
+        }
+        require(modelInspection.isComplete) {
+            "Missing model files: ${modelInspection.missingFiles.joinToString(", ")}"
+        }
+        val runtimeInspection = timer.measure("runtime_inspection_ms") {
+            runtimeRepository.inspect()
+        }
+        require(runtimeInspection.isComplete) {
+            "Missing runtime files: ${runtimeInspection.missingFiles.joinToString(", ")}"
+        }
+
+        if (!backendEngine.isInitialized() || initializedModelId != characterModel.id) {
+            timer.measure("model_install_ms") {
+                modelRepository.installToPrivateStorage(characterModel.modelFiles)
+            }
+            timer.measure("backend_initialization_ms") {
+                backendEngine.initialize(modelRepository.modelRootDirectory(), characterModel)
+            }
+            initializedModelId = characterModel.id
+        }
+        if (!runtimePrepared) {
+            timer.measure("runtime_weights_ms") {
+                runtimeRepository.prepareRuntimeWeights()
+            }
+            runtimePrepared = true
+        }
+
+        val featureExtractor = runtimeFeatureExtractor ?: featureExtractorFactory(backendEngine).also {
+            runtimeFeatureExtractor = it
+        }
+        timer.measure("prepare_total_ms") {
+            featureExtractor.warmup(request)
+        }
+        timer.measure("t2s_session_preload_ms") {
+            backendEngine.preloadT2SSessions()
+        }
+        // Move the largest session-construction cost into background warmup so
+        // the first user request can start with a hot VITS session.
+        timer.measure("vocoder_session_ms") {
+            backendEngine.preloadVocoderSession()
+        }
     }
 
     override fun close() {

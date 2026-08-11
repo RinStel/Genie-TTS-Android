@@ -5,6 +5,7 @@ import org.gradle.api.tasks.testing.Test
 import org.gradle.api.tasks.Copy
 import org.gradle.api.tasks.Exec
 import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
@@ -31,6 +32,43 @@ val runtimeAssetOutput = layout.buildDirectory.dir("generated/runtimeAssets")
 val runtimeAssetManifestOutput = layout.buildDirectory.file(
     "generated/runtimeAssetManifest/chinese-hubert-base_weights_fp16_manifest.json",
 )
+
+// Release builds are always signed locally. The keystore and password file
+// stay ignored; a missing pair must fail the release task instead of emitting
+// an APK that cannot be installed over the previous release.
+val releaseKeystoreFile = rootProject.file("signing/genie-tts-release.jks")
+val releasePasswordFile = rootProject.file("signing/genie-tts-release.password")
+val releaseSigningMaterialAvailable = releaseKeystoreFile.isFile && releasePasswordFile.isFile
+val releaseSigningPassword = if (releasePasswordFile.isFile) {
+    releasePasswordFile.readText(Charsets.UTF_8).trim()
+} else {
+    ""
+}
+abstract class VerifyReleaseSigningMaterialTask : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val keystoreFile: RegularFileProperty
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val passwordFile: RegularFileProperty
+
+    @TaskAction
+    fun verify() {
+        check(keystoreFile.get().asFile.isFile && passwordFile.get().asFile.isFile) {
+            "Missing Android release signing material under ${keystoreFile.get().asFile.parentFile.absolutePath}."
+        }
+        check(passwordFile.get().asFile.readText(Charsets.UTF_8).trim().isNotEmpty()) {
+            "Android release signing password file is empty."
+        }
+    }
+}
+val verifyReleaseSigningMaterial = tasks.register<VerifyReleaseSigningMaterialTask>(
+    "verifyReleaseSigningMaterial",
+) {
+    keystoreFile.set(releaseKeystoreFile)
+    passwordFile.set(releasePasswordFile)
+}
 
 abstract class HighCompressionRuntimeAssetsTask : DefaultTask() {
     @get:InputDirectory
@@ -140,6 +178,9 @@ tasks.register<HighCompressionRuntimeAssetsTask>("bundleRuntimeAssets") {
 
 android {
     namespace = "dev.rinstel.genie_tts"
+    buildFeatures {
+        buildConfig = true
+    }
     compileSdk {
         version = release(37)
     }
@@ -148,8 +189,8 @@ android {
         applicationId = "dev.rinstel.genie_tts"
         minSdk = 30
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -172,9 +213,28 @@ android {
     productFlavors {
         create("cpu") {
             dimension = "runtime"
+            buildConfigField("boolean", "QNN_ENABLED", "false")
             ndk {
                 // The production target is the connected arm64 Android device.
                 abiFilters += "arm64-v8a"
+            }
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DGENIE_ENABLE_NATIVE_DECODER=ON"
+                }
+            }
+        }
+        create("full") {
+            dimension = "runtime"
+            buildConfigField("boolean", "QNN_ENABLED", "true")
+            ndk {
+                // QNN vendor binaries and the ORT QNN AAR are arm64-only.
+                abiFilters += "arm64-v8a"
+            }
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DGENIE_ENABLE_NATIVE_DECODER=ON"
+                }
             }
         }
     }
@@ -185,11 +245,23 @@ android {
         noCompress += listOf("onnx", "bin")
     }
 
+    signingConfigs {
+        create("release") {
+            if (releaseSigningMaterialAvailable) {
+                storeFile = releaseKeystoreFile
+                storePassword = releaseSigningPassword
+                keyAlias = "genie_tts_release"
+                keyPassword = releaseSigningPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             optimization {
                 enable = false
             }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
@@ -213,6 +285,11 @@ tasks.register<Copy>("copyCpuDebugApkToLegacyDebugPath") {
 }
 
 afterEvaluate {
+    tasks.configureEach {
+        if (name.startsWith("assemble") && name.endsWith("Release")) {
+            dependsOn(verifyReleaseSigningMaterial)
+        }
+    }
     tasks.named("assembleDebug") {
         dependsOn("assembleCpuDebug")
         finalizedBy("copyCpuDebugApkToLegacyDebugPath")
@@ -223,7 +300,9 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("com.google.android.material:material:1.14.0")
+    // Keep standard ORT isolated from the optional full/QNN dependency.
     add("cpuImplementation", "com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
+    add("fullImplementation", "com.microsoft.onnxruntime:onnxruntime-android-qnn:1.27.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")

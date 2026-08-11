@@ -67,20 +67,36 @@ interface InferenceTraceLogger {
     companion object {
         private val allowedStages = setOf(
             "generation_total_ms",
+            "model_inspection_ms",
+            "runtime_inspection_ms",
+            "model_install_ms",
+            "backend_initialization_ms",
+            "runtime_weights_ms",
             "prepare_total_ms",
             "backend_total_ms",
             "write_wav_ms",
+            "text_frontend_init_ms",
+            "roberta_session_warmup_ms",
             "text_features_ms",
             "reference_text_features_ms",
+            "reference_conditioning_ms",
+            "prompt_conditioning_ms",
             "reference_audio_load_ms",
             "reference_audio_resample_16k_ms",
             "hubert_ms",
             "speaker_encoder_ms",
             "prompt_encoder_ms",
+            "t2s_input_tensors_ms",
+            "t2s_session_preload_ms",
             "t2s_encoder_ms",
             "t2s_first_decoder_ms",
             "decoder_loop_ms",
+            "semantic_tensor_ms",
+            "vocoder_input_tensors_ms",
+            "vocoder_session_ms",
             "vocoder_ms",
+            "vocoder_output_copy_ms",
+            "session_cleanup_ms",
         )
         fun requireAllowedStage(name: String, elapsedMs: Long) {
             require(name in allowedStages && elapsedMs >= 0L) {
@@ -122,6 +138,7 @@ enum class InferenceTensorMetric(override val wireValue: String) : InferenceTens
     REF_SEQ_HASH("ref_seq_hash"),
     REF_BERT_HASH("ref_bert_hash"),
     REFERENCE_AUDIO_HASH("reference_audio_hash"),
+    REFERENCE_AUDIO_16K_HASH("reference_audio_16k_hash"),
     SSL_CONTENT_HASH("ssl_content_hash"),
     SPEAKER_EMBEDDING_HASH("speaker_embedding_hash"),
     GLOBAL_EMBEDDING_HASH("global_embedding_hash"),
@@ -206,6 +223,21 @@ sealed interface InferenceTraceEvent {
 
     data class Cache(val status: InferenceCacheStatus) : InferenceTraceEvent {
         override fun toLogLine(): String = "reference_cache: ${status.wireValue}"
+    }
+
+    data class SessionCache(
+        val role: InferenceModelRole,
+        val retained: Boolean,
+        val totalMemoryMiB: Long,
+        val availableMemoryMiB: Long,
+    ) : InferenceTraceEvent {
+        init {
+            require(totalMemoryMiB >= 0L && availableMemoryMiB >= 0L)
+        }
+
+        override fun toLogLine(): String =
+            "session_cache: role=${role.wireValue} retained=$retained " +
+                "total_mem_mib=$totalMemoryMiB available_mem_mib=$availableMemoryMiB"
     }
 
     data class Model(val value: InferenceTraceRecord) : InferenceTraceEvent {

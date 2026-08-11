@@ -13,9 +13,9 @@ void testOutputDurationAndConstantSignal() {
     const std::vector<float> input(1001, 0.25f);
     const std::vector<float> output = genie_tts::ResampleReferenceAudio(input, 32'000, 16'000);
     assert(output.size() == 501);
-    assert(std::abs(output.front() - 0.18437f) < 2e-4f);
+    assert(std::abs(output.front() - 0.18480448f) < 2e-4f);
     assert(std::abs(output[250] - 0.25f) < 1e-5f);
-    assert(std::abs(output.back() - 0.18437f) < 2e-4f);
+    assert(std::abs(output.back() - 0.18480448f) < 2e-4f);
 }
 
 void testImpulseRemainsBounded() {

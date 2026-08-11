@@ -43,9 +43,23 @@ data class PromptConditioningCacheKey(
     val auxiliaryReferenceAudioFingerprints: List<ReferenceAudioFingerprint> = emptyList(),
 )
 
+/**
+ * Cache only the active audiobook context. Switching character/reference
+ * replaces the previous entry instead of retaining a hidden model library.
+ */
+internal object AudiobookCachePolicy {
+    const val MAX_REFERENCE_CONDITIONING_ENTRIES = 1
+    const val MAX_PROMPT_CONDITIONING_ENTRIES = 1
+    const val MAX_AUXILIARY_REFERENCE_ENTRIES = 1
+}
+
 class ReferenceConditioningCache(
-    private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+    private val maxEntries: Int = AudiobookCachePolicy.MAX_REFERENCE_CONDITIONING_ENTRIES,
 ) {
+    init {
+        require(maxEntries > 0) { "Reference conditioning cache capacity must be positive." }
+    }
+
     private val entries = object : LinkedHashMap<ReferenceConditioningCacheKey, ReferenceConditioning>(
         maxEntries,
         LOAD_FACTOR,
@@ -74,14 +88,17 @@ class ReferenceConditioningCache(
     }
 
     companion object {
-        private const val DEFAULT_MAX_ENTRIES = 4
         private const val LOAD_FACTOR = 0.75f
     }
 }
 
 class PromptConditioningCache(
-    private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+    private val maxEntries: Int = AudiobookCachePolicy.MAX_PROMPT_CONDITIONING_ENTRIES,
 ) {
+    init {
+        require(maxEntries > 0) { "Prompt conditioning cache capacity must be positive." }
+    }
+
     private val entries = object : LinkedHashMap<PromptConditioningCacheKey, PromptEmbeddings>(
         maxEntries,
         LOAD_FACTOR,
@@ -110,7 +127,6 @@ class PromptConditioningCache(
     }
 
     companion object {
-        private const val DEFAULT_MAX_ENTRIES = 8
         private const val LOAD_FACTOR = 0.75f
     }
 }

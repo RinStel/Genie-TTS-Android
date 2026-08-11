@@ -6,13 +6,16 @@ import org.junit.Test
 
 class BackendCatalogTest {
     @Test
-    fun exposesOnlyCpuBackend() {
+    fun exposesQnnOnlyWhenTheFullRuntimeIsAvailable() {
         val options = BackendCatalog.build(
             qnnAvailable = true,
             xnnpackAvailable = true,
         )
 
-        assertEquals(listOf(ExecutionBackend.CPU), options.map { it.backend })
+        assertEquals(
+            listOf(ExecutionBackend.CPU, ExecutionBackend.QNN),
+            options.map { it.backend },
+        )
         assertTrue(options.all { it.enabled })
     }
 

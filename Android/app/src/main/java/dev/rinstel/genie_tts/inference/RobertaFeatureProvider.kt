@@ -41,6 +41,11 @@ class RobertaFeatureProvider(
         }
     }
 
+    /** Open the ORT graph without running text so the first request is cheap. */
+    fun warmupSession() {
+        ensureSession()
+    }
+
     override fun computeBertFeatures(
         normalizedText: String,
         word2ph: List<Int>,

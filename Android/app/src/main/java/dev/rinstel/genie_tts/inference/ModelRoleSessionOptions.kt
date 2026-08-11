@@ -3,7 +3,7 @@ package dev.rinstel.genie_tts.inference
 import ai.onnxruntime.OrtSession
 import java.util.Locale
 
-/** CPU-only session policy used by the production Android runtime. */
+/** Role-scoped execution-provider policy shared by CPU and full builds. */
 object ModelRoleSessionOptions {
     fun roleForModelFile(modelFileName: String): InferenceModelRole {
         val name = modelFileName.lowercase(Locale.ROOT)
@@ -21,7 +21,13 @@ object ModelRoleSessionOptions {
     fun providerFor(
         backend: ExecutionBackend,
         role: InferenceModelRole,
-    ): InferenceProvider = InferenceProvider.CPU
+    ): InferenceProvider = if (
+        backend == ExecutionBackend.QNN && role in QNN_SYNTHESIS_ROLES
+    ) {
+        InferenceProvider.QNN
+    } else {
+        InferenceProvider.CPU
+    }
 
     fun configure(
         options: OrtSession.SessionOptions,
@@ -29,6 +35,15 @@ object ModelRoleSessionOptions {
         role: InferenceModelRole,
         qnnProviderOptions: Map<String, String> = emptyMap(),
     ) {
-        OrtCpuBackend.configureCpuSessionOptions(options)
+        if (providerFor(backend, role) == InferenceProvider.QNN) {
+            options.addQnn(qnnProviderOptions)
+        } else {
+            OrtCpuBackend.configureCpuSessionOptions(options)
+        }
     }
+
+    private val QNN_SYNTHESIS_ROLES = setOf(
+        InferenceModelRole.T2S,
+        InferenceModelRole.VOCODER,
+    )
 }

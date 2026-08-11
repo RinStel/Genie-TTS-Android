@@ -50,9 +50,32 @@ class AppSettingsRepository(
             storage.putInt(KEY_API_PORT, value.coerceIn(MIN_API_PORT, MAX_API_PORT))
         }
 
+    var t2sCpuThreads: Int
+        get() = cpuThreadSetting(KEY_T2S_CPU_THREADS)
+        set(value) {
+            storage.putInt(KEY_T2S_CPU_THREADS, value.coerceAtLeast(AUTO_CPU_THREADS))
+        }
+
+    var vocoderCpuThreads: Int
+        get() = cpuThreadSetting(KEY_VOCODER_CPU_THREADS)
+        set(value) {
+            storage.putInt(KEY_VOCODER_CPU_THREADS, value.coerceAtLeast(AUTO_CPU_THREADS))
+        }
+
+    fun cpuThreadOptions(availableProcessors: Int): List<Int> {
+        val processors = availableProcessors.coerceAtLeast(1)
+        return buildList {
+            add(AUTO_CPU_THREADS)
+            addAll(1..processors)
+        }
+    }
+
     fun applyThemeMode() {
         AppCompatDelegate.setDefaultNightMode(themeMode.nightMode)
     }
+
+    private fun cpuThreadSetting(key: String): Int =
+        storage.getInt(key, AUTO_CPU_THREADS).coerceAtLeast(AUTO_CPU_THREADS)
 
     private class SharedPreferencesStorage(
         private val preferences: android.content.SharedPreferences,
@@ -84,8 +107,11 @@ class AppSettingsRepository(
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_API_ENABLED = "api_enabled"
         private const val KEY_API_PORT = "api_port"
+        private const val KEY_T2S_CPU_THREADS = "t2s_cpu_threads"
+        private const val KEY_VOCODER_CPU_THREADS = "vocoder_cpu_threads"
         private const val MIN_API_PORT = 1024
         private const val MAX_API_PORT = 65535
+        const val AUTO_CPU_THREADS = 0
         const val DEFAULT_API_PORT = 16580
     }
 }

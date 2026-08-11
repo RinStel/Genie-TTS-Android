@@ -29,7 +29,9 @@ import dev.rinstel.genie_tts.inference.BackendRuntimeCallbacks
 import dev.rinstel.genie_tts.inference.CharacterModel
 import dev.rinstel.genie_tts.inference.ExecutionBackend
 import dev.rinstel.genie_tts.inference.GenerationRequest
+import dev.rinstel.genie_tts.inference.GenerationPipeline
 import dev.rinstel.genie_tts.inference.GenerationStage
+import dev.rinstel.genie_tts.inference.InferenceTraceLogger
 import dev.rinstel.genie_tts.inference.LogcatInferenceTraceLogger
 import dev.rinstel.genie_tts.inference.ModelAssetRepository
 import dev.rinstel.genie_tts.inference.OrtSessionRuntime
@@ -37,6 +39,7 @@ import dev.rinstel.genie_tts.inference.OrtCpuBackend
 import dev.rinstel.genie_tts.inference.OrtRuntimeFeatureExtractor
 import dev.rinstel.genie_tts.inference.RuntimeAssetRepository
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -48,6 +51,15 @@ class GenieBackendService : Service() {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val apiMessenger = Messenger(ApiHandler())
     private val generationGate = GenerationRequestGate()
+
+    private data class WarmupKey(
+        val backend: ExecutionBackend,
+        val modelId: String,
+    )
+
+    private val warmupLock = Any()
+    private var queuedWarmupKey: WarmupKey? = null
+    private var completedWarmupKey: WarmupKey? = null
 
     private lateinit var settingsRepository: AppSettingsRepository
     private lateinit var modelRepository: ModelAssetRepository
@@ -61,6 +73,12 @@ class GenieBackendService : Service() {
 
     @Volatile
     private var resourceReloadPending = false
+
+    @Volatile
+    private var cacheClearPending = false
+
+    @Volatile
+    private var cacheClearScheduled = false
 
     @Volatile
     private var activeDefaults: ActiveDefaults? = null
@@ -105,8 +123,16 @@ class GenieBackendService : Service() {
             runtimeRepository = runtimeRepository,
             backendEngine = OrtCpuBackend(
                 configureSessionOptions = OrtCpuBackend::configureCpuSessionOptions,
-                configureRoleSessionOptions = OrtCpuBackend::configureCpuSessionOptionsForRole,
+                configureRoleSessionOptions = { options, role ->
+                    OrtCpuBackend.configureCpuSessionOptionsForRole(
+                        options = options,
+                        role = role,
+                        t2sThreadLimit = settingsRepository.t2sCpuThreads,
+                        vocoderThreadLimit = settingsRepository.vocoderCpuThreads,
+                    )
+                },
                 traceLogger = traceLogger,
+                useNativeDecoder = true,
             ),
             featureExtractorFactory = { backend ->
                 OrtRuntimeFeatureExtractor(
@@ -118,17 +144,25 @@ class GenieBackendService : Service() {
             },
             traceLogger = traceLogger,
         )
-        // Accelerators remain documented separately, but the production app
-        // intentionally exposes only the measured CPU runtime.
-        apiEnabledBackends = setOf(ExecutionBackend.CPU)
+        if (BuildConfig.QNN_ENABLED) {
+            runtimes[ExecutionBackend.QNN] = createOptionalQnnRuntime(traceLogger)
+        }
+        // A full build may still omit proprietary vendor libraries. Advertise
+        // only providers that completed their native-library inspection.
+        apiEnabledBackends = runtimes
+            .filterValues { it.isAvailable }
+            .keys
+            .toSet()
         createNotificationChannel()
         startForegroundCompat(NOTIFICATION_ID, buildNotification(state))
         syncLocalHttpApiServer()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_RELOAD_RESOURCES) {
-            requestResourceReload()
+        when (intent?.action) {
+            ACTION_RELOAD_RESOURCES -> requestResourceReload()
+            ACTION_RELOAD_INFERENCE_SETTINGS -> requestResourceReload()
+            ACTION_CLEAR_CACHE -> requestCacheClear()
         }
         syncLocalHttpApiServer()
         NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification(state))
@@ -178,6 +212,12 @@ class GenieBackendService : Service() {
             runCatching {
                 worker.execute {
                     runtimes.values.forEach(BackendRuntime::trimMemory)
+                    synchronized(warmupLock) {
+                        // Trimming closes graph sessions, so a later idle
+                        // period must be allowed to schedule warmup again.
+                        completedWarmupKey = null
+                        queuedWarmupKey = null
+                    }
                 }
             }
         }
@@ -199,6 +239,8 @@ class GenieBackendService : Service() {
 
     fun currentState(): BackendServiceState = state
 
+    fun supportedBackends(): Set<ExecutionBackend> = apiEnabledBackends
+
     fun runtimeRootPath(): String = runtimeRepository.runtimeRoot().absolutePath
 
     fun outputRootPath(): String = runtimeRepository.outputRoot().absolutePath
@@ -206,16 +248,18 @@ class GenieBackendService : Service() {
     fun localHttpApiStatus() = LocalHttpApiServer.currentStatus()
 
     fun setActiveDefaults(defaults: ActiveDefaults?) {
-        val cpuDefaults = defaults?.copy(backend = ExecutionBackend.CPU)
-        activeDefaults = cpuDefaults
-        companionDefaults = cpuDefaults
+        val supportedDefaults = defaults?.takeIf { it.backend in apiEnabledBackends }
+            ?: defaults?.copy(backend = ExecutionBackend.CPU)
+        activeDefaults = supportedDefaults
+        companionDefaults = supportedDefaults
+        supportedDefaults?.let(::scheduleWarmup)
     }
 
     fun synthesize(
         backend: ExecutionBackend,
         request: GenerationRequest,
     ): Boolean {
-        if (backend != ExecutionBackend.CPU) return false
+        if (backend !in apiEnabledBackends) return false
         if (state.busy || !generationGate.tryAcquire()) {
             return false
         }
@@ -235,8 +279,8 @@ class GenieBackendService : Service() {
         request: GenerationRequest,
         timeoutMs: Long,
     ): InferResult {
-        if (backend != ExecutionBackend.CPU) {
-            return InferResult.Error("Only the CPU backend is enabled.")
+        if (backend !in apiEnabledBackends) {
+            return InferResult.Error("Backend is not enabled.")
         }
         if (state.busy || !generationGate.tryAcquire()) {
             return InferResult.Busy
@@ -269,6 +313,9 @@ class GenieBackendService : Service() {
         val startedAtMs = SystemClock.elapsedRealtime()
         try {
             val activeRuntime = requireNotNull(runtime) {
+                getString(R.string.prototype_backend_unavailable, backend.label)
+            }
+            require(activeRuntime.isAvailable) {
                 getString(R.string.prototype_backend_unavailable, backend.label)
             }
             val result = withActiveGenerationResources {
@@ -314,8 +361,7 @@ class GenieBackendService : Service() {
                 lastCompletedAtMs = completedAtMs,
                 message = getString(
                     R.string.prototype_service_completed,
-                    result.audioSamples,
-                    result.file.absolutePath,
+                    formatAudioDuration(result.audioSamples),
                 ),
             )
             onComplete?.invoke(InferResult.Success(result.file))
@@ -338,14 +384,38 @@ class GenieBackendService : Service() {
             if (resourceReloadPending) {
                 reloadInferenceResources()
             }
+            if (cacheClearPending) {
+                cacheClearPending = false
+                performCacheClear()
+            }
         }
+    }
+
+    /** Load the full-flavor implementation without linking it into CPU APKs. */
+    private fun createOptionalQnnRuntime(traceLogger: InferenceTraceLogger): BackendRuntime {
+        val runtimeClass = Class.forName("dev.rinstel.genie_tts.inference.QnnBackendRuntime")
+        val constructor = runtimeClass.getConstructor(
+            android.content.Context::class.java,
+            ModelAssetRepository::class.java,
+            RuntimeAssetRepository::class.java,
+            InferenceTraceLogger::class.java,
+        )
+        return constructor.newInstance(
+            this,
+            modelRepository,
+            runtimeRepository,
+            traceLogger,
+        ) as BackendRuntime
     }
 
     private fun requestResourceReload() {
         if (state.busy || generationGate.isClaimed()) {
             resourceReloadPending = true
         } else {
-            reloadInferenceResources()
+            // Resource/session teardown must share the inference worker with
+            // warmup and generation; doing it on the service main thread can
+            // race the queued warmup and close an ORT session underneath it.
+            worker.execute(::reloadInferenceResources)
         }
     }
 
@@ -356,7 +426,84 @@ class GenieBackendService : Service() {
         }
         runtimes.values.forEach(BackendRuntime::close)
         resourceReloadPending = false
+        synchronized(warmupLock) {
+            completedWarmupKey = null
+            queuedWarmupKey = null
+        }
+        activeDefaults?.let(::scheduleWarmup)
     }
+
+    private fun requestCacheClear() {
+        if (cacheClearPending || cacheClearScheduled) return
+        if (state.busy || generationGate.isClaimed()) {
+            cacheClearPending = true
+            return
+        }
+        cacheClearScheduled = true
+        worker.execute {
+            try {
+                performCacheClear()
+            } finally {
+                cacheClearScheduled = false
+            }
+        }
+    }
+
+    private fun performCacheClear() {
+        if (generationGate.isClaimed()) {
+            cacheClearPending = true
+            return
+        }
+        try {
+            // Closing the runtime releases ORT sessions and all conditioning
+            // caches before deleting files that can be regenerated.
+            runtimes.values.forEach(BackendRuntime::close)
+            synchronized(warmupLock) {
+                completedWarmupKey = null
+                queuedWarmupKey = null
+            }
+            val result = runtimeRepository.clearCaches()
+            publishState(
+                stage = GenerationStage.IDLE,
+                busy = false,
+                requestedBackend = state.requestedBackend,
+                resolvedBackend = state.resolvedBackend,
+                runtimeLabel = state.runtimeLabel,
+                initializedModelId = null,
+                latestOutputFilePath = null,
+                progressPercent = null,
+                progressLabel = null,
+                generationDurationMs = null,
+                lastCompletedAtMs = null,
+                message = getString(
+                    R.string.prototype_cache_cleared,
+                    result.generatedAudioFiles,
+                    result.derivedRuntimeFiles,
+                ),
+            )
+        } catch (error: Throwable) {
+            publishState(
+                stage = GenerationStage.ERROR,
+                busy = false,
+                requestedBackend = state.requestedBackend,
+                resolvedBackend = state.resolvedBackend,
+                runtimeLabel = state.runtimeLabel,
+                progressPercent = null,
+                progressLabel = null,
+                generationDurationMs = null,
+                message = getString(
+                    R.string.prototype_cache_clear_failed,
+                    error.message ?: error.javaClass.simpleName,
+                ),
+            )
+        }
+    }
+
+    private fun formatAudioDuration(audioSamples: Int): String = String.format(
+        Locale.US,
+        "%.2fs",
+        audioSamples.toDouble() / GenerationPipeline.OUTPUT_SAMPLE_RATE,
+    )
 
     // One state snapshot fans out to notification, bound UI listeners, and local API clients.
     private fun publishState(
@@ -455,6 +602,57 @@ class GenieBackendService : Service() {
             "power_state: powerSave=$powerSaveMode deviceIdle=$idleMode ignoringBatteryOptimizations=$ignoringBatteryOptimizations",
         )
     }
+
+    private fun scheduleWarmup(defaults: ActiveDefaults) {
+        val key = WarmupKey(defaults.backend, defaults.modelId)
+        synchronized(warmupLock) {
+            if (completedWarmupKey == key || queuedWarmupKey == key) return
+            queuedWarmupKey = key
+        }
+        runCatching {
+            worker.execute {
+                try {
+                    if (activeDefaults?.let { WarmupKey(it.backend, it.modelId) } != key) return@execute
+                    val model = modelRepository.discoverCharacterModels()
+                        .firstOrNull { it.id == key.modelId }
+                        ?: return@execute
+                    val startedAt = SystemClock.elapsedRealtime()
+                    withActiveGenerationResources {
+                        runtimes[key.backend]?.warmup(defaults.toWarmupRequest(model))
+                    }
+                    synchronized(warmupLock) {
+                        completedWarmupKey = key
+                    }
+                    Log.i(
+                        TIMING_LOG_TAG,
+                        "warmup completed backend=${key.backend.label} model=${key.modelId} elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}",
+                    )
+                } catch (error: Throwable) {
+                    Log.i(TIMING_LOG_TAG, "warmup skipped: ${error.message}")
+                } finally {
+                    synchronized(warmupLock) {
+                        if (queuedWarmupKey == key) queuedWarmupKey = null
+                    }
+                }
+            }
+        }.onFailure {
+            synchronized(warmupLock) {
+                if (queuedWarmupKey == key) queuedWarmupKey = null
+            }
+        }
+    }
+
+    private fun ActiveDefaults.toWarmupRequest(model: CharacterModel): GenerationRequest =
+        GenerationRequest(
+            characterModel = model,
+            language = language,
+            promptLanguage = promptLanguage,
+            synthesisText = if (language.startsWith("zh", ignoreCase = true)) "。" else ".",
+            referenceAudioPath = referenceAudioPath,
+            referenceText = referenceText,
+            maxDecoderSteps = maxDecoderSteps,
+            auxiliaryReferenceAudioPaths = auxiliaryReferenceAudioPaths,
+        )
 
     private fun syncLocalHttpApiServer() {
         if (settingsRepository.apiEnabled) {
@@ -559,6 +757,9 @@ class GenieBackendService : Service() {
         private const val KEY_GENERATION_DURATION_MS = "generation_duration_ms"
         private const val KEY_LAST_COMPLETED_AT_MS = "last_completed_at_ms"
         private const val ACTION_RELOAD_RESOURCES = "dev.rinstel.genie_tts.action.RELOAD_RESOURCES"
+        internal const val ACTION_RELOAD_INFERENCE_SETTINGS =
+            "dev.rinstel.genie_tts.action.RELOAD_INFERENCE_SETTINGS"
+        private const val ACTION_CLEAR_CACHE = "dev.rinstel.genie_tts.action.CLEAR_CACHE"
 
         @Volatile
         var companionDefaults: ActiveDefaults? = null
@@ -569,6 +770,12 @@ class GenieBackendService : Service() {
 
         fun reloadResourcesIntent(context: android.content.Context): Intent =
             serviceIntent(context).setAction(ACTION_RELOAD_RESOURCES)
+
+        fun reloadInferenceSettingsIntent(context: android.content.Context): Intent =
+            serviceIntent(context).setAction(ACTION_RELOAD_INFERENCE_SETTINGS)
+
+        fun clearCacheIntent(context: android.content.Context): Intent =
+            serviceIntent(context).setAction(ACTION_CLEAR_CACHE)
     }
 
     private inner class ApiHandler : Handler(Looper.getMainLooper()) {

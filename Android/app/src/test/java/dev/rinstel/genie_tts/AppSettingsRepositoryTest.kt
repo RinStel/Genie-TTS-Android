@@ -12,6 +12,12 @@ class AppSettingsRepositoryTest {
         assertEquals(AppSettingsRepository.ThemeMode.SYSTEM, repository.themeMode)
         assertTrue(repository.apiEnabled)
         assertEquals(AppSettingsRepository.DEFAULT_API_PORT, repository.apiPort)
+        assertEquals(AppSettingsRepository.AUTO_CPU_THREADS, repository.t2sCpuThreads)
+        assertEquals(AppSettingsRepository.AUTO_CPU_THREADS, repository.vocoderCpuThreads)
+        assertEquals(
+            listOf(0, 1, 2, 3, 4),
+            repository.cpuThreadOptions(4),
+        )
     }
 
     @Test
@@ -22,10 +28,14 @@ class AppSettingsRepositoryTest {
         repository.themeMode = AppSettingsRepository.ThemeMode.DARK
         repository.apiEnabled = false
         repository.apiPort = 19090
+        repository.t2sCpuThreads = 3
+        repository.vocoderCpuThreads = 8
 
         assertEquals(AppSettingsRepository.ThemeMode.DARK, repository.themeMode)
         assertEquals(false, repository.apiEnabled)
         assertEquals(19090, repository.apiPort)
+        assertEquals(3, repository.t2sCpuThreads)
+        assertEquals(8, repository.vocoderCpuThreads)
     }
 
     @Test
@@ -34,6 +44,18 @@ class AppSettingsRepositoryTest {
         storage.seedInt("api_port", 80)
 
         assertEquals(1024, AppSettingsRepository(storage).apiPort)
+    }
+
+    @Test
+    fun normalizesNegativeCpuThreadValuesToAutomaticMode() {
+        val storage = FakeStorage()
+        storage.seedInt("t2s_cpu_threads", -1)
+        storage.seedInt("vocoder_cpu_threads", -4)
+
+        val repository = AppSettingsRepository(storage)
+
+        assertEquals(AppSettingsRepository.AUTO_CPU_THREADS, repository.t2sCpuThreads)
+        assertEquals(AppSettingsRepository.AUTO_CPU_THREADS, repository.vocoderCpuThreads)
     }
 
     private class FakeStorage : AppSettingsRepository.Storage {

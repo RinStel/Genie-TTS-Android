@@ -24,6 +24,7 @@ import androidx.core.view.updatePadding
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.textfield.TextInputEditText
@@ -37,6 +38,8 @@ import java.util.concurrent.Executors
 class SettingsActivity : AppCompatActivity() {
     private lateinit var topAppBar: MaterialToolbar
     private lateinit var themeSelector: AutoCompleteTextView
+    private lateinit var t2sCpuThreadSelector: AutoCompleteTextView
+    private lateinit var vocoderCpuThreadSelector: AutoCompleteTextView
     private lateinit var apiEnabledSwitch: MaterialSwitch
     private lateinit var apiPortInput: TextInputEditText
     private lateinit var applyApiPortButton: MaterialButton
@@ -50,6 +53,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var importCharacterModelButton: MaterialButton
     private lateinit var resourceImportProgress: LinearProgressIndicator
     private lateinit var resourceImportStatusValue: TextView
+    private lateinit var clearCacheButton: MaterialButton
     private lateinit var modelPathValue: TextView
     private lateinit var runtimePathValue: TextView
     private lateinit var outputPathValue: TextView
@@ -61,6 +65,7 @@ class SettingsActivity : AppCompatActivity() {
     private val importExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var resourceImportInProgress = false
     private var resourceImportStatus: String? = null
+    private val availableCpuProcessors = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
 
     private val runtimePackagePicker = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -88,6 +93,7 @@ class SettingsActivity : AppCompatActivity() {
         topAppBar.setNavigationOnClickListener { finish() }
         applySystemBarInsets()
         configureThemeSelector()
+        configureThreadSelectors()
         render()
         configureActions()
     }
@@ -107,6 +113,8 @@ class SettingsActivity : AppCompatActivity() {
     private fun bindViews() {
         topAppBar = findViewById(R.id.topAppBar)
         themeSelector = findViewById(R.id.themeSelector)
+        t2sCpuThreadSelector = findViewById(R.id.t2sCpuThreadSelector)
+        vocoderCpuThreadSelector = findViewById(R.id.vocoderCpuThreadSelector)
         apiEnabledSwitch = findViewById(R.id.apiEnabledSwitch)
         apiPortInput = findViewById(R.id.apiPortInput)
         applyApiPortButton = findViewById(R.id.applyApiPortButton)
@@ -120,6 +128,7 @@ class SettingsActivity : AppCompatActivity() {
         importCharacterModelButton = findViewById(R.id.importCharacterModelButton)
         resourceImportProgress = findViewById(R.id.resourceImportProgress)
         resourceImportStatusValue = findViewById(R.id.resourceImportStatusValue)
+        clearCacheButton = findViewById(R.id.clearCacheButton)
         modelPathValue = findViewById(R.id.modelPathValue)
         runtimePathValue = findViewById(R.id.runtimePathValue)
         outputPathValue = findViewById(R.id.outputPathValue)
@@ -148,6 +157,27 @@ class SettingsActivity : AppCompatActivity() {
                 THEME_OPTIONS.map(ThemeOption::label),
             ),
         )
+        configureDropdown(themeSelector)
+    }
+
+    private fun configureThreadSelectors() {
+        val adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_list_item_1,
+            cpuThreadOptions().map(::cpuThreadLabel),
+        )
+        t2sCpuThreadSelector.setAdapter(adapter)
+        vocoderCpuThreadSelector.setAdapter(adapter)
+        configureDropdown(t2sCpuThreadSelector)
+        configureDropdown(vocoderCpuThreadSelector)
+    }
+
+    private fun configureDropdown(selector: AutoCompleteTextView) {
+        // ExposedDropdownMenu does not open reliably for inputType="none"
+        // on some Android vendor builds unless the threshold and click action
+        // are set explicitly.
+        selector.threshold = 0
+        selector.setOnClickListener { selector.showDropDown() }
     }
 
     private fun render() {
@@ -155,6 +185,14 @@ class SettingsActivity : AppCompatActivity() {
             it.mode == settingsRepository.themeMode
         } ?: THEME_OPTIONS.first()
         themeSelector.setText(selectedTheme.label, false)
+        t2sCpuThreadSelector.setText(
+            cpuThreadLabel(normalizeCpuThreadSetting(settingsRepository.t2sCpuThreads)),
+            false,
+        )
+        vocoderCpuThreadSelector.setText(
+            cpuThreadLabel(normalizeCpuThreadSetting(settingsRepository.vocoderCpuThreads)),
+            false,
+        )
         apiEnabledSwitch.isChecked = settingsRepository.apiEnabled
         apiPortInput.setText(settingsRepository.apiPort.toString())
         apiPortInput.setSelection(apiPortInput.text?.length ?: 0)
@@ -196,6 +234,18 @@ class SettingsActivity : AppCompatActivity() {
             settingsRepository.themeMode = theme.mode
             settingsRepository.applyThemeMode()
         }
+        t2sCpuThreadSelector.setOnItemClickListener { _, _, position, _ ->
+            cpuThreadOptions().getOrNull(position)?.let { threadLimit ->
+                settingsRepository.t2sCpuThreads = threadLimit
+                notifyBackendServiceOfInferenceSettingsChange()
+            }
+        }
+        vocoderCpuThreadSelector.setOnItemClickListener { _, _, position, _ ->
+            cpuThreadOptions().getOrNull(position)?.let { threadLimit ->
+                settingsRepository.vocoderCpuThreads = threadLimit
+                notifyBackendServiceOfInferenceSettingsChange()
+            }
+        }
         apiEnabledSwitch.setOnCheckedChangeListener { _, isChecked ->
             settingsRepository.apiEnabled = isChecked
             notifyBackendServiceOfSettingsChange()
@@ -225,6 +275,44 @@ class SettingsActivity : AppCompatActivity() {
         }
         importCharacterModelButton.setOnClickListener {
             characterModelPackagePicker.launch(PACKAGE_MIME_TYPES)
+        }
+        clearCacheButton.setOnClickListener {
+            requestCacheClear()
+        }
+    }
+
+    private fun requestCacheClear() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.prototype_settings_cache_confirm_title)
+            .setMessage(R.string.prototype_settings_cache_confirm_message)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.prototype_settings_cache_clear_button) { _, _ ->
+                startCacheClear()
+            }
+            .show()
+    }
+
+    private fun startCacheClear() {
+        runCatching {
+            ContextCompat.startForegroundService(
+                this,
+                GenieBackendService.clearCacheIntent(this),
+            )
+        }.onSuccess {
+            Snackbar.make(
+                findViewById(R.id.rootLayout),
+                R.string.prototype_settings_cache_clear_requested,
+                Snackbar.LENGTH_LONG,
+            ).show()
+        }.onFailure { error ->
+            Snackbar.make(
+                findViewById(R.id.rootLayout),
+                getString(
+                    R.string.prototype_settings_cache_clear_failed,
+                    error.message ?: error.javaClass.simpleName,
+                ),
+                Snackbar.LENGTH_LONG,
+            ).show()
         }
     }
 
@@ -313,6 +401,27 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun notifyBackendServiceOfSettingsChange() {
         ContextCompat.startForegroundService(this, GenieBackendService.serviceIntent(this))
+    }
+
+    private fun notifyBackendServiceOfInferenceSettingsChange() {
+        ContextCompat.startForegroundService(
+            this,
+            GenieBackendService.reloadInferenceSettingsIntent(this),
+        )
+    }
+
+    private fun cpuThreadOptions(): List<Int> =
+        settingsRepository.cpuThreadOptions(availableCpuProcessors)
+
+    private fun normalizeCpuThreadSetting(value: Int): Int =
+        value.takeIf { it in cpuThreadOptions() } ?: AppSettingsRepository.AUTO_CPU_THREADS
+
+    private fun cpuThreadLabel(value: Int): String = if (
+        value == AppSettingsRepository.AUTO_CPU_THREADS
+    ) {
+        getString(R.string.prototype_settings_cpu_threads_auto)
+    } else {
+        getString(R.string.prototype_settings_cpu_threads_fixed, value)
     }
 
     private fun renderApiExamples(port: Int) {

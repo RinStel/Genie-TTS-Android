@@ -65,6 +65,28 @@ class RuntimeAssetRepository {
         }
     }
 
+    /**
+     * Remove only derived runtime data and generated WAV files. Source runtime
+     * assets remain intact and can be used to rebuild the derived weight file.
+     */
+    @Synchronized
+    fun clearCaches(): CacheClearResult {
+        val generatedAudioFiles = outputRoot()
+            .listFiles()
+            .orEmpty()
+            .count { file ->
+                file.isFile &&
+                    file.extension.equals("wav", ignoreCase = true) &&
+                    file.delete()
+            }
+        val derivedRuntimeFiles = listOf(hubertFp32WeightsFile())
+            .count { file -> file.isFile && file.delete() }
+        return CacheClearResult(
+            generatedAudioFiles = generatedAudioFiles,
+            derivedRuntimeFiles = derivedRuntimeFiles,
+        )
+    }
+
     fun hubertModelFile(): File =
         File(File(runtimeRoot(), "chinese-hubert-base"), "chinese-hubert-base.onnx")
 
@@ -91,3 +113,8 @@ class RuntimeAssetRepository {
         )
     }
 }
+
+data class CacheClearResult(
+    val generatedAudioFiles: Int,
+    val derivedRuntimeFiles: Int,
+)

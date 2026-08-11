@@ -45,6 +45,14 @@ class OrtRuntimeFeatureExtractor(
     }
     private val promptConditioningCache = PromptConditioningCache()
 
+    init {
+        // Re-evaluate the memory watermark after VITS finishes. The session
+        // itself is the largest reusable object in the synthesis path.
+        backend.setMemoryHeadroomProvider {
+            canRetainT2SSessions(logDecision = false)
+        }
+    }
+
     private val robertaProvider: RobertaFeatureProvider? by lazy(LazyThreadSafetyMode.NONE) {
         RobertaFeatureProvider.tryCreate(
             environment = environment,
@@ -70,6 +78,21 @@ class OrtRuntimeFeatureExtractor(
 
     private val textFeatureExtractor: TextFeatureExtractor by lazy(LazyThreadSafetyMode.NONE) {
         DefaultTextFeatureExtractor.fromAssets(context, robertaProvider)
+    }
+
+    fun warmup(request: GenerationRequest) {
+        // Construct the tokenizer/G2P facade and load RoBERTa before the
+        // reference phase. Audio sessions are opened and closed serially.
+        val timer = InferenceTimer(traceLogger)
+        timer.measure("text_frontend_init_ms") {
+            textFeatureExtractor
+        }
+        timer.measure("roberta_session_warmup_ms") {
+            robertaProvider?.warmupSession()
+        }
+        if (File(request.referenceAudioPath).isFile && request.referenceText.isNotBlank()) {
+            prepare(request)
+        }
     }
 
     override fun prepare(request: GenerationRequest): TtsPreparedInput {
@@ -102,15 +125,25 @@ class OrtRuntimeFeatureExtractor(
             val cachedPrompt = promptCacheKey?.let(promptConditioningCache::get)
             val cacheHit = cachedPrimary != null && (!isV2ProPlus || cachedPrompt != null)
             val retainRoberta = canRetainRobertaSession()
-            val retainT2S = canRetainT2SSessions()
+            val canRetainSynthesisSessions = canRetainT2SSessions(logDecision = true)
+            val canRetainT2S = canRetainSynthesisSessions
+            val reuseRetainedT2S = cacheHit && canRetainT2S && backend.hasReusableT2SSessions()
             retainRobertaSession = retainRoberta
 
-            // Character sessions overlap with the vocoder working set. Always
-            // release them after a sentence; keep only the text frontend when
-            // memory permits.
-            backend.setRetainT2SSessionsAfterGeneration(retainT2S)
-            if (cacheHit && retainT2S) {
-                backend.releaseLoadedSessionsKeepingReusableT2S()
+            // Keep the same-character synthesis sessions between audiobook
+            // sentences. A cache miss still starts from a clean working set.
+            backend.setRetainT2SSessionsAfterGeneration(
+                shouldRetainT2SSessionsAfterGeneration(
+                    memoryAllowsRetention = canRetainT2S,
+                ),
+            )
+            backend.setRetainVocoderSessionAfterGeneration(
+                shouldRetainVocoderSessionAfterGeneration(
+                    memoryAllowsRetention = canRetainSynthesisSessions,
+                ),
+            )
+            if (reuseRetainedT2S) {
+                backend.releaseLoadedSessionsKeepingReusableT2SAndVocoder()
             } else {
                 backend.releaseLoadedSessions()
             }
@@ -122,6 +155,8 @@ class OrtRuntimeFeatureExtractor(
                 GenerationProgress.TEXT_FEATURES_START,
                 "Text features",
             )
+            // Audiobook sentences normally differ, so target-text tensors are
+            // rebuilt for every request rather than retained in a cache.
             val textFeatures = timer.measure("text_features_ms") {
                 textFeatureExtractor.extract(
                     request.language,
@@ -157,7 +192,9 @@ class OrtRuntimeFeatureExtractor(
                 ),
             )
             if (!cacheHit) {
-                runtimeAssets.prepareRuntimeWeights()
+                timer.measure("runtime_weights_ms") {
+                    runtimeAssets.prepareRuntimeWeights()
+                }
             }
             backend.reportProgress(
                 GenerationStage.PREPARING_FEATURES,
@@ -165,56 +202,60 @@ class OrtRuntimeFeatureExtractor(
                 GenerationProgress.REFERENCE_CONDITIONING_START,
                 "Reference audio",
             )
-            val primary = if (cachedPrimary != null) {
-                cachedPrimary
-            } else {
-                val refFeatures = timer.measure("reference_text_features_ms") {
-                    textFeatureExtractor.extract(normalizedPromptLanguage, request.referenceText)
-                }
-                timer.event(
-                    InferenceTraceEvent.TensorHash(
-                        InferenceTensorMetric.REF_SEQ_HASH,
-                        InferenceTraceHash.sha256(refFeatures.phoneIds.values),
-                    ),
-                )
-                timer.traceFloatTensor(InferenceTensorMetric.REF_BERT_HASH, refFeatures.bert.values)
-                // Keep RoBERTa warm only under the memory policy above. When
-                // it is not retained, close it before the audio feature models.
-                if (!retainRoberta) {
-                    closeRobertaSession()
-                }
-                referenceCache.getOrPut(primaryCacheKey) {
-                    computePrimaryReferenceConditioning(
-                        request = request,
-                        refFeatures = refFeatures,
-                        isV2ProPlus = isV2ProPlus,
-                        timer = timer,
+            val primary = timer.measure("reference_conditioning_ms") {
+                if (cachedPrimary != null) {
+                    cachedPrimary
+                } else {
+                    val refFeatures = timer.measure("reference_text_features_ms") {
+                        textFeatureExtractor.extract(normalizedPromptLanguage, request.referenceText)
+                    }
+                    timer.event(
+                        InferenceTraceEvent.TensorHash(
+                            InferenceTensorMetric.REF_SEQ_HASH,
+                            InferenceTraceHash.sha256(refFeatures.phoneIds.values),
+                        ),
                     )
+                    timer.traceFloatTensor(InferenceTensorMetric.REF_BERT_HASH, refFeatures.bert.values)
+                    // Keep RoBERTa warm only under the memory policy above. When
+                    // it is not retained, close it before the audio feature models.
+                    if (!retainRoberta) {
+                        closeRobertaSession()
+                    }
+                    referenceCache.getOrPut(primaryCacheKey) {
+                        computePrimaryReferenceConditioning(
+                            request = request,
+                            refFeatures = refFeatures,
+                            isV2ProPlus = isV2ProPlus,
+                            timer = timer,
+                        )
+                    }
                 }
             }
             val reference = if (!isV2ProPlus) {
                 primary
             } else {
-                val prompt = cachedPrompt ?: promptConditioningCache.getOrPut(requireNotNull(promptCacheKey)) {
-                    backend.reportProgress(
-                        GenerationStage.PREPARING_FEATURES,
-                        "preparing_features",
-                        GenerationProgress.PROMPT_CONDITIONING_START,
-                        "Prompt conditioning",
-                    )
-                    // Capability inspection opens the optional prompt graph.
-                    if (!retainRoberta) {
-                        closeRobertaSession()
+                val prompt = timer.measure("prompt_conditioning_ms") {
+                    cachedPrompt ?: promptConditioningCache.getOrPut(requireNotNull(promptCacheKey)) {
+                        backend.reportProgress(
+                            GenerationStage.PREPARING_FEATURES,
+                            "preparing_features",
+                            GenerationProgress.PROMPT_CONDITIONING_START,
+                            "Prompt conditioning",
+                        )
+                        // Capability inspection opens the optional prompt graph.
+                        if (!retainRoberta) {
+                            closeRobertaSession()
+                        }
+                        requireNotNull(backend.multiReferenceCapability())
+                            .validateAuxiliaryReferencePaths(auxiliaryReferencePaths)
+                        backend.releasePreparationSessions()
+                        computePromptConditioning(
+                            primary = primary,
+                            auxiliaryReferencePaths = auxiliaryReferencePaths,
+                            modelInterfaceVersion = modelInterfaceVersion(request.characterModel),
+                            timer = timer,
+                        )
                     }
-                    requireNotNull(backend.multiReferenceCapability())
-                        .validateAuxiliaryReferencePaths(auxiliaryReferencePaths)
-                    backend.releasePreparationSessions()
-                    computePromptConditioning(
-                        primary = primary,
-                        auxiliaryReferencePaths = auxiliaryReferencePaths,
-                        modelInterfaceVersion = modelInterfaceVersion(request.characterModel),
-                        timer = timer,
-                    )
                 }
                 primary.copy(
                     globalEmbedding = prompt.globalEmbedding,
@@ -232,10 +273,21 @@ class OrtRuntimeFeatureExtractor(
             // Feature preparation can allocate hundreds of megabytes. Recheck
             // the watermark after that work so the next T2S request cannot
             // retain decoder graphs on an already pressured device.
-            val retainT2SAfterPreparation = retainT2S && canRetainT2SSessions()
-            backend.setRetainT2SSessionsAfterGeneration(retainT2SAfterPreparation)
-            if (!retainT2SAfterPreparation) {
+            val canRetainT2SAfterPreparation = canRetainT2S &&
+                canRetainT2SSessions(logDecision = true)
+            backend.setRetainT2SSessionsAfterGeneration(
+                shouldRetainT2SSessionsAfterGeneration(
+                    memoryAllowsRetention = canRetainT2SAfterPreparation,
+                ),
+            )
+            backend.setRetainVocoderSessionAfterGeneration(
+                shouldRetainVocoderSessionAfterGeneration(
+                    memoryAllowsRetention = canRetainT2SAfterPreparation,
+                ),
+            )
+            if (!canRetainT2SAfterPreparation) {
                 backend.releaseT2SSessions()
+                backend.releaseVocoderSession()
             }
 
             return reference.toPreparedInput(textFeatures)
@@ -254,13 +306,24 @@ class OrtRuntimeFeatureExtractor(
             memoryInfo.availMem >= MIN_ROBERTA_CACHE_AVAILABLE_MEMORY_BYTES
     }
 
-    private fun canRetainT2SSessions(): Boolean {
+    private fun canRetainT2SSessions(logDecision: Boolean = false): Boolean {
         val manager = context.getSystemService(ActivityManager::class.java) ?: return false
         val memoryInfo = ActivityManager.MemoryInfo()
         manager.getMemoryInfo(memoryInfo)
-        return !memoryInfo.lowMemory &&
+        val retained = !memoryInfo.lowMemory &&
             memoryInfo.totalMem >= MIN_T2S_CACHE_TOTAL_MEMORY_BYTES &&
             memoryInfo.availMem >= MIN_T2S_CACHE_AVAILABLE_MEMORY_BYTES
+        if (logDecision) {
+            traceLogger.event(
+                InferenceTraceEvent.SessionCache(
+                    role = InferenceModelRole.T2S,
+                    retained = retained,
+                    totalMemoryMiB = memoryInfo.totalMem / (1024L * 1024L),
+                    availableMemoryMiB = memoryInfo.availMem / (1024L * 1024L),
+                ),
+            )
+        }
+        return retained
     }
 
     fun releaseLoadedSessions() {
@@ -291,7 +354,6 @@ class OrtRuntimeFeatureExtractor(
                     ),
                 ),
             )
-            OrtCpuBackend.warmUpSession(environment, hubertSession!!)
         }
     }
 
@@ -317,7 +379,6 @@ class OrtRuntimeFeatureExtractor(
                     ),
                 ),
             )
-            OrtCpuBackend.warmUpSession(environment, speakerSession!!)
         }
     }
 
@@ -356,6 +417,7 @@ class OrtRuntimeFeatureExtractor(
         val refAudio16k = timer.measure("reference_audio_resample_16k_ms") {
             WavAudioReader.resample(refAudio32k, 32000, 16000)
         }
+        timer.traceFloatTensor(InferenceTensorMetric.REFERENCE_AUDIO_16K_HASH, refAudio16k)
         val sslContent = timer.measure("hubert_ms") {
             ensureHubertSession()
             try {
@@ -637,14 +699,26 @@ class OrtRuntimeFeatureExtractor(
     }
 
     companion object {
+        internal fun shouldRetainT2SSessionsAfterGeneration(
+            memoryAllowsRetention: Boolean,
+        ): Boolean = memoryAllowsRetention
+
+        internal fun shouldRetainVocoderSessionAfterGeneration(
+            memoryAllowsRetention: Boolean,
+        ): Boolean = memoryAllowsRetention
+
         private const val REFERENCE_PREPROCESSING_VERSION =
             "reference-conditioning-v2-soxr-hq-silence-0.3"
-        private const val AUXILIARY_REFERENCE_CACHE_CAPACITY = 8
+        // Auxiliary references are a per-prompt working set. The prompt cache
+        // keeps the combined result, so retaining old auxiliary audio only
+        // increases memory use for the audiobook path.
+        private const val AUXILIARY_REFERENCE_CACHE_CAPACITY =
+            AudiobookCachePolicy.MAX_AUXILIARY_REFERENCE_ENTRIES
         private const val MIN_ROBERTA_CACHE_TOTAL_MEMORY_BYTES = 8L * 1024L * 1024L * 1024L
         private const val MIN_ROBERTA_CACHE_AVAILABLE_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L
         private const val MIN_T2S_CACHE_TOTAL_MEMORY_BYTES = 8L * 1024L * 1024L * 1024L
-        // Keep a margin for VITS and Android services while allowing the two
-        // decoder graphs to stay warm on high-memory devices.
-        private const val MIN_T2S_CACHE_AVAILABLE_MEMORY_BYTES = 2400L * 1024L * 1024L
+        // Retain the decoder graphs only when the device has enough headroom;
+        // the cache is bounded to the active character model.
+        private const val MIN_T2S_CACHE_AVAILABLE_MEMORY_BYTES = 2100L * 1024L * 1024L
     }
 }

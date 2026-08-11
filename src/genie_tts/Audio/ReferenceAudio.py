@@ -73,6 +73,7 @@ class ReferenceAudio:
             )
         with trace.measure("reference_audio_resample_16k_ms"):
             self.audio_16k: np.ndarray = soxr.resample(self.audio_32k, 32000, 16000, quality='hq')
+        trace.tensor_hash("reference_audio_16k", self.audio_16k)
 
         self.audio_32k = np.expand_dims(self.audio_32k, axis=0)
         self.audio_16k = np.expand_dims(self.audio_16k, axis=0)  # 增加 Batch_Size 维度
